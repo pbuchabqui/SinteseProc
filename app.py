@@ -38,18 +38,34 @@ def ler_pdf(b: bytes):
     return "\n".join(pags), len(pags)
 
 def buscar_secoes(txt: str):
-    padroes = {
-        "sentenca":    r"S\s*E\s*N\s*T\s*E\s*N\s*[CÇ]\s*A|VISTOS.*RELATADOS",
+    """
+    Decisões ficam no FINAL do processo — busca de trás pra frente.
+    Ficha e ponto ficam no início/meio — busca normal.
+    Captura até 600 linhas por seção.
+    """
+    padroes_fim = {
+        "sentenca":    r"S\s*E\s*N\s*T\s*E\s*N\s*[CÇ]\s*A|VISTOS[,\s]+RELATADOS|VISTOS E JULGADOS",
         "acordao":     r"A\s*C\s*[OÓ]\s*R\s*D\s*[AÃ]\s*O",
-        "dispositivo": r"ISTO POSTO|DIANTE DO EXPOSTO|PELO EXPOSTO|DECIDO",
-        "ficha":       r"FICHA FINANCEIRA|CONTRACHEQUE|HOLERITE|FOLHA DE PAGAMENTO",
-        "ponto":       r"CART[AÃ]O DE PONTO|ESPELHO DE PONTO|REGISTRO DE PONTO",
+        "dispositivo": r"ISTO POSTO|DIANTE DO EXPOSTO|PELO EXPOSTO|DECIDO[:\s]|DECIDE-SE",
     }
-    linhas = txt.split("\n"); sec = {}
-    for nome, p in padroes.items():
+    padroes_inicio = {
+        "ficha": r"FICHA FINANCEIRA|CONTRACHEQUE|HOLERITE|FOLHA DE PAGAMENTO",
+        "ponto": r"CART[AÃ]O DE PONTO|ESPELHO DE PONTO|REGISTRO DE PONTO",
+    }
+    linhas = txt.split("\n")
+    sec = {}
+    # Busca de trás pra frente para decisões
+    for nome, p in padroes_fim.items():
+        for i in range(len(linhas)-1, -1, -1):
+            if re.search(p, linhas[i], re.IGNORECASE):
+                sec[nome] = "\n".join(linhas[i:i+600])
+                break
+    # Busca normal para documentos contábeis
+    for nome, p in padroes_inicio.items():
         for i, l in enumerate(linhas):
             if re.search(p, l, re.IGNORECASE):
-                sec[nome] = "\n".join(linhas[i:i+200]); break
+                sec[nome] = "\n".join(linhas[i:i+600])
+                break
     return sec
 
 def dados_basicos(txt: str):
@@ -60,7 +76,7 @@ def dados_basicos(txt: str):
 
 MODELO_RACIOCINIO = "openai/gpt-oss-120b"
 
-def ia(txt: str, instrucao: str) -> dict:
+def ia(txt: str, instrucao: str, limite: int = 60000) -> dict:
     modelo = get_secret("GROQ_MODEL") or "llama-3.3-70b-versatile"
     usa_raciocinio = modelo == MODELO_RACIOCINIO
 
@@ -71,17 +87,15 @@ def ia(txt: str, instrucao: str) -> dict:
             {"role":"system","content":(
                 "Você é perito contábil trabalhista brasileiro. "
                 "Responda APENAS com JSON válido, sem texto antes/depois, sem ```json```.")},
-            {"role":"user","content":f"{instrucao}\n\nTEXTO:\n{txt[:25000]}"},
+            {"role":"user","content":f"{instrucao}\n\nTEXTO:\n{txt[:limite]}"},
         ]
     )
     if usa_raciocinio:
-        # gpt-oss-120b: parâmetros do modelo de raciocínio
         params["max_completion_tokens"] = 3000
         params["temperature"]           = 0.6
         params["top_p"]                 = 1
         params["reasoning_effort"]      = get_secret("GROQ_REASONING_EFFORT") or "medium"
     else:
-        # llama-3.3-70b-versatile e outros: parâmetros padrão
         params["max_tokens"]  = 3000
         params["temperature"] = 0.1
 
@@ -381,19 +395,44 @@ with st.spinner("Lendo PDF..."):
 
 st.write(f"✅ {npags} páginas — **{bas.get('numero_processo')}**")
 
+# Mostrar o que foi localizado por seção
+secoes_encontradas = [k for k in secs]
+if secoes_encontradas:
+    st.write(f"📑 Seções localizadas: {', '.join(secoes_encontradas)}")
+else:
+    st.warning("⚠️ Nenhuma seção localizada por palavra-chave. O texto completo será enviado à IA.")
+
 if f_partes:
-    with st.spinner("Partes (IA)..."): partes = ext_partes(txt)
+    # Partes ficam no início — usa primeiros 60k chars
+    t = txt[:60000]
+    with st.spinner("Partes (IA)..."): partes = ext_partes(t)
     st.write(f"✅ {partes.get('reclamante','?')} × {partes.get('reclamada_1','?')}"
              if "erro" not in partes else "⚠️ Partes: extração parcial")
 
 if f_decisoes:
-    t = (secs.get("sentenca","") + "\n" + secs.get("acordao","")) or txt
+    # Sentença + acórdão localizados pela busca reversa
+    partes_decisao = []
+    if secs.get("sentenca"):  partes_decisao.append(secs["sentenca"])
+    if secs.get("acordao"):   partes_decisao.append(secs["acordao"])
+    if partes_decisao:
+        t = "\n\n---\n\n".join(partes_decisao)
+        st.caption(f"  → Usando seções localizadas ({len(t):,} chars)")
+    else:
+        # Fallback: últimos 60k chars (decisões ficam no final)
+        t = txt[-60000:]
+        st.caption("  → Seção não localizada. Usando final do documento.")
     with st.spinner("Decisões (IA)..."): decisoes = ext_decisoes(t)
     n = len(decisoes.get("decisoes",[]))
     st.write(f"✅ {n} decisão(ões)" if n else "⚠️ Nenhuma decisão localizada")
 
 if f_criterios:
-    t = secs.get("dispositivo","") or secs.get("sentenca","") or txt
+    partes_crit = []
+    if secs.get("dispositivo"): partes_crit.append(secs["dispositivo"])
+    if secs.get("sentenca"):    partes_crit.append(secs["sentenca"])
+    if partes_crit:
+        t = "\n\n---\n\n".join(partes_crit)
+    else:
+        t = txt[-60000:]
     with st.spinner("Critérios (IA)..."): criterios = ext_criterios(t)
     st.write("✅ Critérios extraídos" if "erro" not in criterios else "⚠️ Critérios: extração parcial")
 
