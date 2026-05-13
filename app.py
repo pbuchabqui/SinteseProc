@@ -76,7 +76,7 @@ def dados_basicos(txt: str):
 
 MODELO_RACIOCINIO = "openai/gpt-oss-120b"
 
-def ia(txt: str, instrucao: str, limite: int = 60000) -> dict:
+def ia(txt: str, instrucao: str, limite: int = 30000) -> dict:
     modelo = get_secret("GROQ_MODEL") or "llama-3.3-70b-versatile"
     usa_raciocinio = modelo == MODELO_RACIOCINIO
 
@@ -99,47 +99,60 @@ def ia(txt: str, instrucao: str, limite: int = 60000) -> dict:
         params["max_tokens"]  = 3000
         params["temperature"] = 0.1
 
-    r   = Groq(api_key=GROQ_KEY).chat.completions.create(**params)
-    raw = r.choices[0].message.content
-    try: return json.loads(re.sub(r"```(?:json)?|```","",raw).strip())
-    except: return {"erro": "JSON inválido", "texto_bruto": raw}
+    try:
+        r   = Groq(api_key=GROQ_KEY).chat.completions.create(**params)
+        raw = r.choices[0].message.content
+        try:
+            return json.loads(re.sub(r"```(?:json)?|```","",raw).strip())
+        except json.JSONDecodeError:
+            return {"erro": "JSON inválido", "texto_bruto": raw}
+    except Exception as e:
+        msg = str(e)
+        if "rate_limit" in msg.lower() or "429" in msg:
+            return {"erro": "Rate limit atingido. Aguarde 1 minuto e tente novamente.", "detalhe": msg}
+        if "tokens" in msg.lower() or "context" in msg.lower():
+            return {"erro": "Texto muito longo para o modelo. Tente com um PDF menor.", "detalhe": msg}
+        return {"erro": f"Erro na API: {msg}"}
 
 def ext_partes(txt):
+    # Partes ficam no início — 15k chars é suficiente
     return ia(txt,"""Extraia do texto do processo trabalhista:
 {"reclamante":"nome","cpf_reclamante":"000.000.000-00","adv_reclamante":"nome",
 "oab_reclamante":"OAB/XX 00000","reclamada_1":"razão social","cnpj_reclamada_1":"",
 "adv_reclamada_1":"nome","reclamada_2":"ou null","vara_trabalho":"ex: 1ª VT Porto Alegre/RS",
 "data_admissao":"dd/mm/aaaa","data_demissao":"dd/mm/aaaa","data_ajuizamento":"dd/mm/aaaa",
-"funcao":"cargo"}""")
+"funcao":"cargo"}""", limite=15000)
 
 def ext_decisoes(txt):
+    # Decisões podem ser longas — 40k chars
     return ia(txt,"""Extraia as decisões judiciais. Transcreva LITERALMENTE o dispositivo.
 {"decisoes":[{"tipo":"Sentença|Acórdão|Embargos","data":"dd/mm/aaaa",
 "dispositivo":"texto literal completo","resultado_reclamante":"procedente|improcedente|parcialmente",
-"verbas_deferidas":["lista"]}]}""")
+"verbas_deferidas":["lista"]}]}""", limite=40000)
 
 def ext_criterios(txt):
+    # Critérios estão no dispositivo — 30k chars
     return ia(txt,"""Extraia os critérios de liquidação.
 {"criterios":{"base_salarial":"","periodo_apurado":{"inicio":"dd/mm/aaaa","fim":"dd/mm/aaaa"},
 "jornada_contratual":"","jornada_real_apurada":"","divisor":"220|200|outro",
 "adicional_horas_extras":"50%|100%","reflexos":["DSR","férias","13º","aviso","FGTS"],
 "fgts":{"base":"todas as verbas","multa_40":true},"atualizacao_monetaria":"SELIC (ADC 58)",
 "juros":"SELIC|1% am","inss_empregado":"descontar","inss_patronal":"a cargo da reclamada",
-"ir":"tabela progressiva|isento","exclusoes_expressas":[],"observacoes":""}}""")
+"ir":"tabela progressiva|isento","exclusoes_expressas":[],"observacoes":""}}""", limite=30000)
 
 def ext_ficha(txt):
     return ia(txt,"""Extraia a ficha financeira. Liste TODAS as rubricas sem omitir nenhuma.
 {"rubricas":["SALÁRIO BASE","HE 50%","..."],
 "competencias":[{"competencia":"MM/AAAA",
 "valores":{"SALÁRIO BASE":{"referencia":"220h","valor":3000.00}},
-"total_proventos":0,"inss_base":0,"inss_desconto":0,"fgts_base":0}]}""")
+"total_proventos":0,"inss_base":0,"inss_desconto":0,"fgts_base":0}]}""", limite=40000)
 
 def ext_ponto(txt):
     return ia(txt,"""Extraia o espelho de ponto com todos os registros.
 {"registros":[{"data":"dd/mm/aaaa","dia_semana":"SEG",
 "entradas_saidas":["08:00","12:00","13:00","18:00"],
 "horas_trabalhadas":"8:00","horas_extras":"0:00",
-"observacao":"DSR|Falta|Feriado|null"}]}""")
+"observacao":"DSR|Falta|Feriado|null"}]}""", limite=40000)
 
 # ── Geração Word ──────────────────────────────────────────────────────────────
 
@@ -403,27 +416,29 @@ else:
     st.warning("⚠️ Nenhuma seção localizada por palavra-chave. O texto completo será enviado à IA.")
 
 if f_partes:
-    # Partes ficam no início — usa primeiros 60k chars
-    t = txt[:60000]
+    t = txt[:15000]
     with st.spinner("Partes (IA)..."): partes = ext_partes(t)
-    st.write(f"✅ {partes.get('reclamante','?')} × {partes.get('reclamada_1','?')}"
-             if "erro" not in partes else "⚠️ Partes: extração parcial")
+    if "erro" in partes:
+        st.error(f"❌ Partes: {partes['erro']}")
+    else:
+        st.write(f"✅ {partes.get('reclamante','?')} × {partes.get('reclamada_1','?')}")
 
 if f_decisoes:
-    # Sentença + acórdão localizados pela busca reversa
     partes_decisao = []
     if secs.get("sentenca"):  partes_decisao.append(secs["sentenca"])
     if secs.get("acordao"):   partes_decisao.append(secs["acordao"])
     if partes_decisao:
         t = "\n\n---\n\n".join(partes_decisao)
-        st.caption(f"  → Usando seções localizadas ({len(t):,} chars)")
+        st.caption(f"  → Seções localizadas ({len(t):,} chars)")
     else:
-        # Fallback: últimos 60k chars (decisões ficam no final)
-        t = txt[-60000:]
+        t = txt[-40000:]
         st.caption("  → Seção não localizada. Usando final do documento.")
     with st.spinner("Decisões (IA)..."): decisoes = ext_decisoes(t)
-    n = len(decisoes.get("decisoes",[]))
-    st.write(f"✅ {n} decisão(ões)" if n else "⚠️ Nenhuma decisão localizada")
+    if "erro" in decisoes:
+        st.error(f"❌ Decisões: {decisoes['erro']}")
+    else:
+        n = len(decisoes.get("decisoes",[]))
+        st.write(f"✅ {n} decisão(ões)" if n else "⚠️ Nenhuma decisão localizada")
 
 if f_criterios:
     partes_crit = []
@@ -432,9 +447,12 @@ if f_criterios:
     if partes_crit:
         t = "\n\n---\n\n".join(partes_crit)
     else:
-        t = txt[-60000:]
+        t = txt[-30000:]
     with st.spinner("Critérios (IA)..."): criterios = ext_criterios(t)
-    st.write("✅ Critérios extraídos" if "erro" not in criterios else "⚠️ Critérios: extração parcial")
+    if "erro" in criterios:
+        st.error(f"❌ Critérios: {criterios['erro']}")
+    else:
+        st.write("✅ Critérios extraídos")
 
 if f_ficha:
     t = secs.get("ficha","") or txt
