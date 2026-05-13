@@ -328,13 +328,43 @@ def extrair_decisao_de_doc(doc_info: dict) -> dict:
     linhas     = texto.split("\n")
     bloco      = texto
 
-    # Dispositivo — do marcador até o fim
+    # ── Dispositivo ──────────────────────────────────────────────────────────────
+    # Para sentenças longas, priorizar marcadores condenatórios sobre os introdutórios
+    # Ordem de preferência: Ante o exposto > Condeno > ISSO POSTO > ...
+    MARCADORES_CONDENATORIO = [
+        r"Ante\s+o\s+exposto[,\.]",          # sentença TRT — resume a condenação
+        r"(?:^|\n)\s*Condeno\b",              # condenação direta
+        r"(?:^|\n)\s*JULGO\s+PROCED",
+        r"NEGO\s+PROVIMENTO",                 # acórdão — nega o recurso
+        r"DAR\s+PARCIAL\s+PROVIMENTO",        # acórdão — provimento parcial
+        r"DAR\s+PROVIMENTO",                  # acórdão — provimento total
+        r"ACORDAM\s+os",                      # acórdão — início do decisum
+        r"Nego\s+seguimento",                 # TST/TRT — inadmite recurso
+        r"denego\s+seguimento",               # TST — nega AIRR
+        r"^(III\s*\)\s*)?CONCLUSÃO",          # TST monocrático
+        r"Recebo\s+o\s+recurso",              # despacho de admissão
+    ]
+    MARCADORES_INTRO = [                      # usados só se nada acima for encontrado
+        r"ISSO\s+POSTO", r"ISTO\s+POSTO",
+        r"DIANTE\s+DO\s+EXPOSTO", r"PELO\s+EXPOSTO",
+        r"DECIDO\s*[:;]", r"DECIDE-SE",
+    ]
+
     dispositivo = ""
     inicio_disp = None
+
+    # 1ª passagem: marcadores condenatórios (mais precisos)
     for j, l in enumerate(linhas):
-        if any(re.search(p, l, re.IGNORECASE) for p in MARCADORES_DISPOSITIVO):
+        if any(re.search(p, l, re.IGNORECASE | re.MULTILINE) for p in MARCADORES_CONDENATORIO):
             inicio_disp = j
             break
+
+    # 2ª passagem: marcadores introdutórios (fallback)
+    if inicio_disp is None:
+        for j, l in enumerate(linhas):
+            if any(re.search(p, l, re.IGNORECASE) for p in MARCADORES_INTRO):
+                inicio_disp = j
+                break
 
     if inicio_disp is not None:
         linhas_disp = []
@@ -344,23 +374,58 @@ def extrair_decisao_de_doc(doc_info: dict) -> dict:
                 break
         dispositivo = "\n".join(linhas_disp).strip()
     else:
-        # Fallback: texto completo do documento (despachos curtos, decisões monocráticas)
         linhas_uteis = [l for l in linhas if l.strip() and not re.search(
             r"^Fls\.|^Documento assinado|^https?://|^Número do (processo|documento)|^Certificado",
             l.strip()
         )]
         dispositivo = "\n".join(linhas_uteis).strip()
 
-    # Resultado — keyword
-    resultado = "parcialmente procedente"
-    if re.search(r"JULGO\s+IMPROCEDENTE|NEGO\s+PROVIMENTO|improcedentes?", bloco, re.IGNORECASE):
-        resultado = "improcedente / negado provimento"
-    elif re.search(r"JULGO\s+PROCEDENTE[^S]|procedentes?\s+em\s+parte", bloco, re.IGNORECASE):
-        resultado = "parcialmente procedente"
-    elif re.search(r"DAR\s+PARCIAL\s+PROVIMENTO|parcial\s+provimento", bloco, re.IGNORECASE):
-        resultado = "parcialmente provido"
-    elif re.search(r"DAR\s+PROVIMENTO|provido", bloco, re.IGNORECASE):
-        resultado = "provido"
+    # ── Resultado — baseado no tipo e conteúdo do documento ──────────────────────
+    tipo_cat = doc_info.get("tipo_cat", "")
+    titulo   = doc_info.get("titulo", "").lower()
+
+    if tipo_cat == "decisao":
+        if re.search(r"Recebo\s+o\s+recurso|recurso.*recebido", bloco, re.IGNORECASE):
+            resultado = "despacho — recurso admitido"
+        elif re.search(r"denego\s+seguimento|negado\s+seguimento|intranscend", bloco, re.IGNORECASE):
+            resultado = "recurso não admitido (TST)"  # verifica antes de "Nego seguimento"
+        elif re.search(r"Nego\s+seguimento|não\s+admito|deserção", bloco, re.IGNORECASE):
+            resultado = "recurso não admitido"
+        else:
+            resultado = "decisão interlocutória"
+
+    elif tipo_cat == "embargos":
+        if re.search(r"NEGO\s+PROVIMENTO|embargos.*rejeit|não\s+merece\s+prosperar", bloco, re.IGNORECASE):
+            resultado = "embargos rejeitados"
+        elif re.search(r"ACOLHO|acolhidos", bloco, re.IGNORECASE):
+            resultado = "embargos acolhidos"
+        else:
+            resultado = "embargos parcialmente acolhidos"
+
+    elif tipo_cat == "acordao":
+        if re.search(r"DAR\s+PARCIAL\s+PROVIMENTO", bloco, re.IGNORECASE):
+            resultado = "parcialmente provido"
+        elif re.search(r"DAR\s+PROVIMENTO\b", bloco, re.IGNORECASE):
+            resultado = "provido"
+        elif re.search(r"NEGAR\s+PROVIMENTO|NEGO\s+PROVIMENTO|unanimidade.*negar", bloco, re.IGNORECASE):
+            resultado = "negado provimento"
+        else:
+            resultado = "parcialmente provido"
+
+    else:  # sentenca — inclui julgamento de embargos de declaração
+        # Sentença sobre embargos: tipo_cat é "sentenca" mas trata embargos
+        if re.search(r"embargos\s+de\s+declara", bloco, re.IGNORECASE) and \
+           re.search(r"NEGO\s+PROVIMENTO|não\s+merece\s+prosperar|rejeito\s+os\s+embargos", bloco, re.IGNORECASE):
+            resultado = "embargos rejeitados"
+        elif re.search(r"embargos\s+de\s+declara", bloco, re.IGNORECASE) and \
+             re.search(r"ACOLHO|acolhidos", bloco, re.IGNORECASE):
+            resultado = "embargos acolhidos"
+        elif re.search(r"JULGO\s+IMPROCEDENTE|totalmente\s+improcedente", bloco, re.IGNORECASE):
+            resultado = "improcedente"
+        elif re.search(r"PROCEDENTE[^S]\b|integralmente\s+procedente", bloco, re.IGNORECASE):
+            resultado = "procedente"
+        else:
+            resultado = "parcialmente procedente"
 
     # Verbas — lista pré-definida
     verbas = [v for v in VERBAS_CONHECIDAS
@@ -608,17 +673,74 @@ def extrair_ponto(doc: fitz.Document) -> dict:
 
 MODELO_RACIOCINIO = "openai/gpt-oss-120b"
 
-def chamar_ia(txt: str, instrucao: str, limite: int = 30000) -> dict:
-    """Chamada única ao Groq — usada apenas para critérios de liquidação."""
+# ── Base de conhecimento trabalhista (de references/trabalhista.md do ContextAI) ──
+CONHECIMENTO_TRABALHISTA = """
+## Critérios de liquidação frequentes
+
+### Horas extras — bancários
+- Divisor 180: bancário comum (art. 224, caput, CLT).
+- Divisor 220: cargo de confiança (art. 224, §2º, CLT).
+- Base de cálculo: salário + todas as verbas de natureza salarial — Súmula 264/TST.
+- Adicional: o percentual convencional (CCT) prevalece sobre o legal.
+
+### Reflexos (incidências)
+RSR/sábados/feriados | férias + 1/3 | 13º salário | FGTS (sem multa 40% se contrato vigente) | aviso prévio (apenas em rescisão).
+
+### Tema 9/TST — IRR 0010169-57.2013.5.05.0024
+- RSR majorado por horas extras repercute em férias, 13º e FGTS APENAS a partir de 20/03/2023.
+- Período anterior: OJ 394/SBDI-1/TST (não repercute).
+- Sempre dividir o cálculo nesses dois marcos temporais.
+
+### Atualização monetária (pós-ADC 58/STF)
+- IPCA-E até 31/12/2021.
+- SELIC simples a partir de 01/01/2022 (juros + correção unificados).
+- NÃO duplicar juros e correção no mesmo período.
+
+### Jurisprudência de referência
+- Bancário cargo de confiança: Art. 224 §2º CLT; Súmula 102/TST
+- Gratificação de função: Súmula 109/TST
+- Divisor bancário: Súmula 124/TST
+- Base de cálculo HE: Súmula 264/TST
+- RSR e HE: OJ 394/SBDI-1; IRR Tema 9/TST
+- Atualização monetária: ADC 58/STF; Súmula 381/TST
+- INSS sobre parcelas: Súmula 368/TST (apurado mês a mês sobre valor histórico)
+- IRPF: Art. 12-A Lei 7.713/1988 (tabela progressiva acumulada)
+
+### INSS — Súmula 26/TRT-4
+Descontos apurados mês a mês sobre o valor histórico, com exclusão dos juros de mora,
+respeitado o limite máximo mensal do salário de contribuição, observadas as alíquotas
+vigentes à época e os valores já recolhidos.
+"""
+
+# ── Regras absolutas de análise pericial (de instrucoes-analise.md do ContextAI) ──
+REGRAS_ANALISE = """
+## Regras absolutas
+- Responda sempre em português brasileiro formal.
+- Seja preciso com valores monetários e datas (use vírgula decimal, R$).
+- Se o contexto for insuficiente, diga qual informação falta — NUNCA invente dados.
+- Baseie-se apenas no conteúdo fornecido do processo.
+- Cite súmulas, OJs, artigos de lei e teses quando aplicáveis.
+- Documentação incompleta: diga claramente e oriente como proceder.
+"""
+
+
+def chamar_ia(txt: str, instrucao: str, limite: int = 30000,
+              incluir_base_trabalhista: bool = False) -> dict:
+    """Chamada ao Groq com retry automático em caso de rate limit."""
+    import time
+
     modelo = get_secret("GROQ_MODEL") or "llama-3.3-70b-versatile"
     usa_raciocinio = modelo == MODELO_RACIOCINIO
 
+    base = CONHECIMENTO_TRABALHISTA if incluir_base_trabalhista else ""
     params = dict(
         model=modelo, stream=False,
         messages=[
             {"role":"system","content":(
-                "Você é perito contábil trabalhista brasileiro. "
-                "Responda APENAS com JSON válido, sem texto antes/depois, sem ```json```.")},
+                "Você é perito contábil trabalhista brasileiro especializado em liquidação de sentença no TRT4.\n"
+                + REGRAS_ANALISE
+                + (f"\n\n## Base de referência jurídica\n{base}" if base else "")
+                + "\n\nResponda APENAS com JSON válido, sem texto antes/depois, sem ```json```.")},
             {"role":"user","content":f"{instrucao}\n\nTEXTO:\n{txt[:limite]}"},
         ]
     )
@@ -628,17 +750,27 @@ def chamar_ia(txt: str, instrucao: str, limite: int = 30000) -> dict:
     else:
         params.update({"max_tokens":3000,"temperature":0.1})
 
-    try:
-        r   = Groq(api_key=GROQ_KEY).chat.completions.create(**params)
-        raw = r.choices[0].message.content
-        return json.loads(re.sub(r"```(?:json)?|```","",raw).strip())
-    except json.JSONDecodeError:
-        return {"erro": "JSON inválido", "texto_bruto": raw}
-    except Exception as e:
-        msg = str(e)
-        if "rate_limit" in msg.lower() or "429" in msg:
-            return {"erro": "Rate limit atingido. Aguarde 1 minuto e tente novamente."}
-        return {"erro": f"Erro na API: {msg}"}
+    for tentativa in range(3):
+        try:
+            r   = Groq(api_key=GROQ_KEY).chat.completions.create(**params)
+            raw = r.choices[0].message.content
+            try:
+                return json.loads(re.sub(r"```(?:json)?|```","",raw).strip())
+            except json.JSONDecodeError:
+                return {"erro": "JSON inválido", "texto_bruto": raw}
+
+        except Exception as e:
+            msg = str(e)
+            if "rate_limit" in msg.lower() or "429" in msg:
+                if tentativa < 2:
+                    espera = 65 if tentativa == 0 else 90
+                    st.warning(f"⏳ Rate limit — aguardando {espera}s (tentativa {tentativa+1}/3)...")
+                    time.sleep(espera)
+                    continue
+                return {"erro": "Rate limit persistente. Tente novamente em alguns minutos."}
+            return {"erro": f"Erro na API: {msg}"}
+
+    return {"erro": "Falha após 3 tentativas."}
 
 
 def ext_criterios(dispositivo: str) -> dict:
@@ -649,6 +781,8 @@ def ext_criterios(dispositivo: str) -> dict:
     """
     return chamar_ia(dispositivo, """
 Analise o dispositivo da sentença/acórdão trabalhista e extraia os critérios de liquidação.
+Use a base de referência jurídica fornecida para preencher critérios não explicitados na sentença
+(ex: se não há índice de correção, aplicar SELIC por ADC 58; se não há divisor, usar o padrão da categoria).
 
 {
   "criterios": {
@@ -656,27 +790,52 @@ Analise o dispositivo da sentença/acórdão trabalhista e extraia os critérios
     "periodo_apurado": {"inicio": "dd/mm/aaaa", "fim": "dd/mm/aaaa"},
     "jornada_contratual": "ex: 8h diárias / 44h semanais",
     "jornada_real_apurada": "ex: 10h diárias conforme cartões de ponto",
-    "divisor": "220 ou 200 ou outro valor",
-    "adicional_horas_extras": "50% ou 100%",
+    "divisor": "220 ou 180 ou outro — justificar",
+    "adicional_horas_extras": "50% ou 100% ou percentual CCT",
     "reflexos": ["DSR", "férias", "13º salário", "aviso prévio", "FGTS"],
+    "marco_tema9": "aplicar Tema 9/TST a partir de 20/03/2023 se houver RSR majorado",
     "fgts": {"base": "todas as verbas deferidas", "multa_40": true},
-    "atualizacao_monetaria": "SELIC (ADC 58/59) ou outro índice",
-    "juros": "SELIC ou 1% ao mês",
-    "inss_empregado": "descontar na fonte conforme tabela progressiva",
+    "atualizacao_monetaria": "IPCA-E até 31/12/2021 + SELIC a partir de 01/01/2022 (ADC 58)",
+    "juros": "incluídos na SELIC a partir de 01/01/2022",
+    "inss_empregado": "Súmula 26/TRT-4: mês a mês sobre valor histórico",
     "inss_patronal": "a cargo da reclamada",
-    "ir": "tabela progressiva ou isento",
+    "ir": "tabela progressiva acumulada (art. 12-A Lei 7.713/1988) ou isento",
     "exclusoes_expressas": ["ex: dano moral não integra base FGTS"],
-    "observacoes": "outros critérios relevantes não listados acima"
+    "observacoes": "outros critérios relevantes incluindo verbas deferidas e deduções autorizadas"
   }
 }
-""", limite=30000)
+""", limite=30000, incluir_base_trabalhista=True)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# BLOCO 3 — GERAÇÃO DE ARQUIVOS
-# ══════════════════════════════════════════════════════════════════════════════
+def ext_alertas_periciais(texto_processo: str) -> dict:
+    """
+    Gera a Seção 8 — Alertas Periciais (obrigatória conforme instrucoes-analise.md).
+    Usa o texto das decisões + despacho de nomeação para identificar riscos e atenções.
+    """
+    return chamar_ia(texto_processo, """
+Analise o processo trabalhista e gere os ALERTAS PERICIAIS para o perito.
+Esta é a seção mais importante do relatório — seja específico e prático.
 
-def gerar_word(dados, decisoes, criterios) -> bytes:
+{
+  "alertas": {
+    "formato_laudo": "PJe-Calc obrigatório | laudo livre | verificar despacho",
+    "prazo_laudo": "data ou 'verificar despacho de nomeação'",
+    "pje_calc_exigido": true,
+    "documentacao_faltante": ["lista do que não está nos autos mas é necessário"],
+    "pontos_atencao": [
+      "alertas específicos do caso — riscos, armadilhas, divergências prováveis"
+    ],
+    "marcos_temporais_criticos": [
+      "ex: contrato anterior a 20/03/2023 — verificar Tema 9/TST para RSR"
+    ],
+    "vincendas": "apurar parcelas vincendas até data-base do laudo (art. 899/CLT)",
+    "honorarios_risco": "OJ 19/TRT-3: divergência significativa pode gerar condenação em honorários",
+    "observacoes_finais": "outros alertas não cobertos acima"
+  }
+}
+""", limite=20000, incluir_base_trabalhista=True)
+
+def gerar_word(dados, decisoes, criterios, alertas=None) -> bytes:
     doc = Document()
     doc.styles["Normal"].font.name = "Arial"
     doc.styles["Normal"].font.size = Pt(11)
@@ -745,12 +904,52 @@ def gerar_word(dados, decisoes, criterios) -> bytes:
             campo("FGTS", f"{fgts.get('base','')} — {'com' if fgts.get('multa_40') else 'sem'} multa 40%")
         if c.get("exclusoes_expressas"):
             campo("Exclusões expressas", "; ".join(c["exclusoes_expressas"]))
+        if c.get("marco_tema9"):
+            campo("Marco Tema 9/TST", c["marco_tema9"])
+
+    # Seção 4 — Alertas Periciais (obrigatório conforme instrucoes-analise.md)
+    if alertas and "erro" not in alertas and alertas.get("alertas"):
+        a = alertas["alertas"]
+        h("4. Alertas Periciais", 2)
+        p = doc.add_paragraph()
+        run = p.add_run("⚠️ Esta seção deve ser lida antes de iniciar o laudo.")
+        run.bold = True; run.font.color.rgb = None
+
+        def alerta(label, val):
+            if not val: return
+            if isinstance(val, list) and not val: return
+            p = doc.add_paragraph(style="List Bullet")
+            p.add_run(f"{label}: ").bold = True
+            p.add_run(", ".join(val) if isinstance(val, list) else str(val))
+
+        campo("Formato do laudo",    a.get("formato_laudo"))
+        campo("Prazo",               a.get("prazo_laudo"))
+        campo("PJe-Calc exigido",    "Sim" if a.get("pje_calc_exigido") else "Verificar")
+        campo("Apuração vincendas",  a.get("vincendas"))
+        campo("Risco honorários",    a.get("honorarios_risco"))
+
+        if a.get("documentacao_faltante"):
+            h("Documentação faltante", 3)
+            for item in a["documentacao_faltante"]:
+                doc.add_paragraph(item, style="List Bullet")
+
+        if a.get("pontos_atencao"):
+            h("Pontos de atenção", 3)
+            for item in a["pontos_atencao"]:
+                doc.add_paragraph(item, style="List Bullet")
+
+        if a.get("marcos_temporais_criticos"):
+            h("Marcos temporais críticos", 3)
+            for item in a["marcos_temporais_criticos"]:
+                doc.add_paragraph(item, style="List Bullet")
+
+        campo("Observações", a.get("observacoes_finais"))
 
     buf = io.BytesIO(); doc.save(buf); buf.seek(0)
     return buf.getvalue()
 
 
-def gerar_markdown(dados, decisoes, criterios) -> str:
+def gerar_markdown(dados, decisoes, criterios, alertas=None) -> str:
     md = ["# SÍNTESE DE DECISÕES PARA LIQUIDAÇÃO\n",
           "## 1. Identificação do Processo\n"]
 
@@ -794,6 +993,28 @@ def gerar_markdown(dados, decisoes, criterios) -> str:
         if fgts: md.append(f"**FGTS:** {fgts.get('base','')} — {'com' if fgts.get('multa_40') else 'sem'} multa 40%")
         if c.get("exclusoes_expressas"):
             md.append(f"**Exclusões:** {'; '.join(c['exclusoes_expressas'])}")
+        if c.get("marco_tema9"):
+            md.append(f"**Marco Tema 9/TST:** {c['marco_tema9']}")
+
+    if alertas and "erro" not in alertas and alertas.get("alertas"):
+        a = alertas["alertas"]
+        md.append("\n## 4. Alertas Periciais ⚠️\n")
+        if a.get("formato_laudo"):   md.append(f"**Formato:** {a['formato_laudo']}")
+        if a.get("prazo_laudo"):     md.append(f"**Prazo:** {a['prazo_laudo']}")
+        if a.get("pje_calc_exigido") is not None:
+            md.append(f"**PJe-Calc:** {'Exigido' if a['pje_calc_exigido'] else 'Verificar'}")
+        if a.get("vincendas"):       md.append(f"**Vincendas:** {a['vincendas']}")
+        if a.get("honorarios_risco"):md.append(f"**Risco honorários:** {a['honorarios_risco']}")
+        if a.get("documentacao_faltante"):
+            md.append("\n### Documentação faltante")
+            for item in a["documentacao_faltante"]: md.append(f"- {item}")
+        if a.get("pontos_atencao"):
+            md.append("\n### Pontos de atenção")
+            for item in a["pontos_atencao"]: md.append(f"- {item}")
+        if a.get("marcos_temporais_criticos"):
+            md.append("\n### Marcos temporais críticos")
+            for item in a["marcos_temporais_criticos"]: md.append(f"- {item}")
+        if a.get("observacoes_finais"): md.append(f"\n**Observações:** {a['observacoes_finais']}")
 
     return "\n\n".join(md)
 
@@ -905,6 +1126,8 @@ with c1:
     f_dados     = st.checkbox("Dados do processo e partes",        value=True)
     f_decisoes  = st.checkbox("Decisões judiciais (dispositivos)", value=True)
     f_criterios = st.checkbox("Critérios de liquidação ⚡IA",      value=True)
+    f_alertas   = st.checkbox("Alertas periciais ⚡IA",            value=True,
+                               help="Seção 8: riscos, prazos, documentação faltante, PJe-Calc")
 with c2:
     f_ficha = st.checkbox("Ficha financeira (holerites)")
     f_ponto = st.checkbox("Espelho de ponto")
@@ -937,7 +1160,7 @@ if not st.button("⚙️ Processar", type="primary"):
 # ── Processamento ─────────────────────────────────────────────────────────────
 
 pdf_bytes = arq.read()
-dados = decisoes_lista = criterios = ficha = ponto = None
+dados = decisoes_lista = criterios = ficha = ponto = alertas = None
 
 with st.spinner("Lendo PDF..."):
     doc_fitz, capa, txt, toc, npags = ler_pdf(pdf_bytes)
@@ -974,6 +1197,21 @@ if f_criterios:
     else:
         st.write("✅ Critérios extraídos")
 
+if f_alertas:
+    # Usa sentença + decisões + despacho de nomeação como fonte
+    texto_alertas = "\n\n".join(filter(None, [
+        secs.get("sentenca","")[:10000],
+        secs.get("acordao","")[:5000],
+        secs.get("decisao","")[:5000],
+    ])) or txt[-20000:]
+    with st.spinner("Gerando alertas periciais (⚡IA — 1 chamada)..."):
+        alertas = ext_alertas_periciais(texto_alertas)
+    if "erro" in alertas:
+        st.error(f"❌ Alertas: {alertas['erro']}")
+    else:
+        n_alertas = len(alertas.get("alertas", {}).get("pontos_atencao", []))
+        st.write(f"✅ Alertas gerados ({n_alertas} ponto(s) de atenção)")
+
 if f_ficha:
     with st.spinner("Extraindo ficha financeira (tabelas PyMuPDF)..."):
         ficha = extrair_ficha(doc_fitz)
@@ -1001,13 +1239,13 @@ num = (dados or {}).get("numero_processo","processo").replace("-","").replace(".
 
 if o_word:
     with st.spinner("Gerando Word..."):
-        wb = gerar_word(dados or {}, decisoes_lista or [], criterios or {})
+        wb = gerar_word(dados or {}, decisoes_lista or [], criterios or {}, alertas or {})
     st.download_button("📄 Word (.docx)", wb, f"sintese_{num}.docx",
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
 if o_md:
     with st.spinner("Gerando Markdown..."):
-        md = gerar_markdown(dados or {}, decisoes_lista or [], criterios or {})
+        md = gerar_markdown(dados or {}, decisoes_lista or [], criterios or {}, alertas or {})
     st.download_button("📝 Markdown (.md)", md.encode(), f"sintese_{num}.md","text/markdown")
 
 if o_xl:
