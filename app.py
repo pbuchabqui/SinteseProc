@@ -35,19 +35,26 @@ if not GROQ_KEY:
 # BLOCO 1 — EXTRAÇÃO DETERMINÍSTICA (sem IA)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def ler_pdf(b: bytes) -> tuple[fitz.Document, str, int]:
-    """Abre o PDF e retorna (doc, texto_completo, total_paginas)."""
+def ler_pdf(b: bytes) -> tuple[fitz.Document, str, str, list, int]:
+    """Abre o PDF e retorna (doc, capa, texto_completo, toc, total_paginas).
+    capa = texto da página 1 (cabeçalho PJe com partes explícitas).
+    toc  = sumário estruturado do PDF (lista de [nivel, titulo, pagina]).
+    """
     doc = fitz.open(stream=b, filetype="pdf")
+    capa = doc[0].get_text() if len(doc) > 0 else ""
+    toc  = doc.get_toc()  # sumário embutido — disponível em todos os PDFs PJe
     paginas = [f"[PÁGINA {i+1}]\n{p.get_text()}" for i, p in enumerate(doc)]
-    return doc, "\n".join(paginas), len(paginas)
+    return doc, capa, "\n".join(paginas), toc, len(paginas)
 
 
 # ── 1.1 Dados do processo (regex) ────────────────────────────────────────────
 
-def extrair_dados(txt: str) -> dict:
+def extrair_dados(txt: str, capa: str = "") -> dict:
     """
-    Extrai por regex todos os campos com padrão fixo.
-    Sem IA — padrões CNJ/TRT são determinísticos.
+    capa = texto da página 1 do PJe (fonte mais confiável para partes).
+    Partes: lidas da capa primeiro; fallback no corpo do processo.
+    CPF/CNPJ: exigem label próximo para evitar falsos positivos de URLs PJe.
+    Datas: buscadas nos dois sentidos (label→data e data→label).
     """
     def primeiro(padrao, texto=txt, grupo=0):
         m = re.search(padrao, texto, re.IGNORECASE)
@@ -64,82 +71,87 @@ def extrair_dados(txt: str) -> dict:
         or primeiro(r"(VARA\s+DO\s+TRABALHO[^\n]{0,60})", grupo=1)
     if vara: vara = vara.strip().rstrip(".,;:()")
 
-    # ── CPF — formatar 000.000.000-00 ──
-    cpf_raw = primeiro(r"(\d{3}[\.\-]?\d{3}[\.\-]?\d{3}[\-]?\d{2})")
-    def formatar_cpf(raw):
-        if not raw: return None
-        d = re.sub(r"\D","",raw)
-        return f"{d[:3]}.{d[3:6]}.{d[6:9]}-{d[9:]}" if len(d)==11 else raw
-    cpf = formatar_cpf(cpf_raw)
+    # ── CPF — exige label "CPF" a ≤80 chars antes, para não pegar hashes de URL PJe ──
+    def formatar_cpf(d):
+        return f"{d[:3]}.{d[3:6]}.{d[6:9]}-{d[9:]}" if len(d) == 11 else d
 
-    # ── CNPJ — formatar 00.000.000/0000-00 ──
-    cnpj_raw = primeiro(r"(\d{2}[\.\-]?\d{3}[\.\-]?\d{3}[\/]?\d{4}[\-]?\d{2})")
+    cpf = None
+    m_cpf = re.search(
+        r"CPF[/\w\s\.]{0,30}?n?[º.]?\s*(\d{3}[\. ]?\d{3}[\. ]?\d{3}[\-\s]?\d{2})(?!\d)",
+        txt, re.IGNORECASE
+    )
+    if m_cpf:
+        d = re.sub(r"\D", "", m_cpf.group(1))
+        cpf = formatar_cpf(d) if len(d) == 11 else None
+
+    # ── CNPJ ──
     def formatar_cnpj(raw):
         if not raw: return None
-        d = re.sub(r"\D","",raw)
-        return f"{d[:2]}.{d[2:5]}.{d[5:8]}/{d[8:12]}-{d[12:]}" if len(d)==14 else raw
+        d = re.sub(r"\D", "", raw)
+        return f"{d[:2]}.{d[2:5]}.{d[5:8]}/{d[8:12]}-{d[12:]}" if len(d) == 14 else raw
+
+    cnpj_raw = primeiro(
+        r"CNPJ[^\d]{0,20}(\d{2}[\.-]?\d{3}[\.-]?\d{3}[/]?\d{4}[-]?\d{2})", grupo=1
+    ) or primeiro(r"(\d{2}[\.-]?\d{3}[\.-]?\d{3}[/]\d{4}[-]\d{2})", grupo=1)
     cnpj = formatar_cnpj(cnpj_raw)
 
-    # ── OABs — deduplicar mantendo ordem ──
+    # ── OABs — normalizar e deduplicar ──
+    def normalizar_oab(s):
+        m = re.search(r"OAB[/\s]*([A-Z]{2})[/\s#nº°.]*\s*([\d\.]+)", s, re.IGNORECASE)
+        if m:
+            num = re.sub(r"\.", "", m.group(2))  # remove pontos do número
+            return f"OAB/{m.group(1).upper()} {num}"
+        return s.strip()
     oabs_raw = todos(r"OAB[/\s]*[A-Z]{2}[/\s#nº°.]*\s*[\d\.]+")
-    oabs = list(dict.fromkeys(o.strip() for o in oabs_raw))
+    oabs = list(dict.fromkeys(normalizar_oab(o) for o in oabs_raw))[:6]
 
-    # ── Datas — janela restrita de 120 chars após o label ──
-    def data_apos_label(labels):
-        for label in labels:
-            m = re.search(
-                rf"{label}[^:.\n]{{0,30}}:\s*(\d{{2}}/\d{{2}}/\d{{4}})"
-                rf"|{label}[^\d\n]{{0,60}}(\d{{2}}/\d{{2}}/\d{{4}})",
-                txt, re.IGNORECASE
-            )
-            if m: return m.group(1) or m.group(2)
-        return None
-
-    data_admissao    = data_apos_label(["admiss[aã]o", "admitid[ao]", "contratad[ao]"])
-    data_demissao    = data_apos_label(["demiss[aã]o", "despedid[ao]", "desligad[ao]",
-                                        "dispens[ao]", "término do contrato"])
-    data_ajuizamento = data_apos_label(["ajuizamento", "distribui[çc][aã]o", "protocolo"])
-
-    # ── Reclamante — linha após o label ──
-    def nome_apos_label_estrito(labels, max_chars=60):
-        for label in labels:
-            # Busca em linha própria ou após ":" — nome não pode conter verbos/preposições
-            m = re.search(
-                rf"(?:^|\n)\s*{label}\s*:?\s*([A-ZÁÉÍÓÚÂÊÎÔÛÃÕ][A-ZÁÉÍÓÚÂÊÎÔÛÃÕa-záéíóúâêîôûãõ\s]{{4,{max_chars}}})",
-                txt, re.IGNORECASE | re.MULTILINE
-            )
-            if m:
-                nome = m.group(1).strip().rstrip(".,;:()")
-                # Rejeitar se parece texto narrativo (contém verbos comuns)
-                if re.search(r"\b(não|pelo|pela|para|com|que|foi|era|está|tinha)\b",
-                             nome, re.IGNORECASE):
-                    continue
-                # Rejeitar se contém CPF/CNPJ/OAB inline
-                if re.search(r"CPF|CNPJ|OAB|\d{3}\.\d{3}", nome, re.IGNORECASE):
-                    continue
+    # ── Partes — da CAPA (página 1 PJe) ──
+    # Formato canônico: RECLAMANTE: NOME / RECLAMADO: NOME / ADVOGADO: NOME
+    def nome_da_capa(label, texto=None):
+        src = texto or capa or txt
+        m = re.search(rf"^{label}:\s*(.+)$", src, re.IGNORECASE | re.MULTILINE)
+        if m:
+            nome = m.group(1).strip().rstrip(".,;")
+            if not re.search(r"PERITO|ADVOGADO|RECLAMANTE|RECLAMADO", nome, re.IGNORECASE):
                 return nome
         return None
 
-    reclamante = nome_apos_label_estrito(["RECLAMANTE","AUTOR[AE]?","EXEQUENTE","REQUERENTE"])
+    reclamante = nome_da_capa("RECLAMANTE") or nome_da_capa("AUTOR[AE]?")
+    reclamada  = nome_da_capa("RECLAMADO[A]?") or nome_da_capa("R[EÉ]U") \
+              or nome_da_capa("EXECUTAD[AO]")
 
-    # ── Reclamada — buscar nome na linha imediatamente antes ou depois do CNPJ ──
-    reclamada = None
-    if cnpj_raw:
-        digitos_cnpj = re.sub(r"\D","",cnpj_raw)
-        # Procura no texto ao redor do CNPJ
-        m = re.search(
-            r"([A-ZÁÉÍÓÚÂÊÎÔÛÃÕ][A-ZÁÉÍÓÚa-záéíóúâêîôûãõ\s\-&\.]{4,60})"
-            r"[^\n]{0,30}" + re.escape(digitos_cnpj[:8]),
-            txt
-        )
-        if m:
-            reclamada = m.group(1).strip().rstrip(".,;:()")
-    # Fallback: label estrito
-    if not reclamada:
-        reclamada = nome_apos_label_estrito(["RECLAMADA","EXECUTADA","REQUERIDA"])
+    advs_capa = re.findall(r"^ADVOGADO:\s*(.+)$", capa or "", re.IGNORECASE | re.MULTILINE)
+    adv_rec   = advs_capa[0].strip() if len(advs_capa) > 0 else None
+    adv_emp   = advs_capa[1].strip() if len(advs_capa) > 1 else None
 
-    # ── Advogados — nome após Dr./Dra. e próximo a OAB ──
-    advs = todos(r"Dr[a]?\.\s+([A-ZÁÉÍÓÚÂÊÎÔÛÃÕ][a-záéíóúâêîôûãõ\s]{5,50}?)(?=\s*[-,\n]|OAB|$)")
+    # ── Datas — busca bidirecional (label→data e data→label) ──
+    def data_por_label(labels, fonte=None):
+        src = fonte or txt
+        for label in labels:
+            # sentido normal: "Admissão: 12/06/2021" ou "Admissão ... 12/06/2021"
+            m = re.search(
+                rf"{label}[^:\n]{{0,30}}:\s*(\d{{2}}/\d{{2}}/\d{{4}})"
+                rf"|{label}[^\d\n]{{0,60}}(\d{{2}}/\d{{2}}/\d{{4}})",
+                src, re.IGNORECASE
+            )
+            if m: return m.group(1) or m.group(2)
+            # sentido inverso: "12/06/2021 - Admissão" (formato CTPS)
+            m2 = re.search(rf"(\d{{2}}/\d{{2}}/\d{{4}})\s*[-–]\s*{label}", src, re.IGNORECASE)
+            if m2: return m2.group(1)
+        return None
+
+    # Ajuizamento — usar Data da Autuação da capa (mais preciso)
+    data_ajuizamento = data_por_label([r"Data\s+da\s+Autua[çc][aã]o",
+                                       r"Autua[çc][aã]o"], fonte=capa)                     or data_por_label([r"ajuizamento", r"distribui[çc][aã]o"])
+    data_admissao  = data_por_label([r"admiss[aã]o", r"admitid[ao]"])
+    data_demissao  = data_por_label([r"Rescis[aã]o\s+Contratual", r"demiss[aã]o",
+                                     r"despedid[ao]", r"desligad[ao]"])
+
+    # Função/cargo — padrão CTPS
+    funcao = None
+    m_func = re.search(r"Cargo\s+exercido\s+de\s+([A-Za-záéíóúâêîôûãõÁÉÍÓÚ\s\.]{3,50}?)(?:\n|$|,|\d)",
+                       txt, re.IGNORECASE)
+    if m_func: funcao = m_func.group(1).strip()
 
     return {
         "numero_processo":  numero or "Não localizado",
@@ -149,45 +161,91 @@ def extrair_dados(txt: str) -> dict:
         "reclamada_1":      reclamada,
         "cnpj_reclamada_1": cnpj,
         "oabs":             oabs,
-        "adv_reclamante":   advs[0] if len(advs) > 0 else None,
-        "adv_reclamada_1":  advs[1] if len(advs) > 1 else None,
+        "adv_reclamante":   adv_rec,
+        "adv_reclamada_1":  adv_emp,
         "data_admissao":    data_admissao,
         "data_demissao":    data_demissao,
         "data_ajuizamento": data_ajuizamento,
+        "funcao":           funcao,
     }
-
 
 # ── 1.2 Localizar seções (busca bidirecional) ─────────────────────────────────
 
-def buscar_secoes(txt: str) -> dict:
+def buscar_secoes(doc: fitz.Document, toc: list, txt: str) -> dict:
     """
-    Decisões ficam no FINAL — busca de trás pra frente.
-    Ficha e ponto ficam no início/meio — busca normal.
+    Localiza seções usando o sumário (TOC) do PDF quando disponível.
+    O TOC do PJe lista cada documento com tipo, data e página exata.
+    Fallback para busca textual se o TOC não tiver informação suficiente.
     """
-    padroes_fim = {
-        "sentenca":    r"S\s*E\s*N\s*T\s*E\s*N\s*[CÇ]\s*A|VISTOS[,\s]+RELATADOS|VISTOS E JULGADOS",
-        "acordao":     r"A\s*C\s*[OÓ]\s*R\s*D\s*[AÃ]\s*O",
-        "dispositivo": r"ISTO\s+POSTO|DIANTE\s+DO\s+EXPOSTO|PELO\s+EXPOSTO|DECIDO\b|DECIDE-SE",
+    MAPA_TIPOS = {
+        "Sentença":               "sentenca",
+        "Acórdão":                "acordao",
+        "Embargos de Declaração": "embargos",
+        "Decisão":                "decisao",
+        "Ficha Financeira":       "ficha",
+        "Ficha de Registro":      "ficha",
+        "Cartão de Ponto":        "ponto",
+        "Espelho de Ponto":       "ponto",
     }
-    padroes_inicio = {
-        "ficha": r"FICHA FINANCEIRA|CONTRACHEQUE|HOLERITE|FOLHA DE PAGAMENTO",
-        "ponto": r"CART[AÃ]O DE PONTO|ESPELHO DE PONTO|REGISTRO DE PONTO",
-    }
-    linhas = txt.split("\n")
+    RELEVANTES = {"sentenca", "acordao", "embargos", "decisao", "ficha", "ponto"}
+    npags = len(doc)
     sec = {}
-    for nome, p in padroes_fim.items():
-        for i in range(len(linhas)-1, -1, -1):
-            if re.search(p, linhas[i], re.IGNORECASE | re.MULTILINE):
-                sec[nome] = "\n".join(linhas[i:i+600])
-                break
-    for nome, p in padroes_inicio.items():
+
+    if toc:
+        # ── Abordagem primária: navegar pelo TOC ──
+        entradas = []
+        for idx, entry in enumerate(toc):
+            _, titulo, pag_ini = entry
+            tipo_cat = next(
+                (cat for tipo_str, cat in MAPA_TIPOS.items()
+                 if tipo_str.lower() in titulo.lower()),
+                None
+            )
+            if not tipo_cat or tipo_cat not in RELEVANTES:
+                continue
+            # Página final = início da próxima entrada - 1
+            pag_fim = (toc[idx+1][2] - 1) if idx+1 < len(toc) else npags
+            entradas.append((tipo_cat, titulo, pag_ini-1, pag_fim-1))  # 0-based
+
+        # Para cada categoria, consolidar texto das páginas relevantes
+        # Decisões: agrupadas por categoria, em ordem cronológica
+        from collections import defaultdict
+        grupos = defaultdict(list)
+        for cat, titulo, p0, p1 in entradas:
+            texto_doc = "\n".join(doc[i].get_text() for i in range(p0, min(p1+1, npags)))
+            grupos[cat].append(f"\n--- {titulo} ---\n{texto_doc}")
+
+        for cat, blocos in grupos.items():
+            sec[cat] = "\n\n".join(blocos)
+
+    # ── Fallback textual para PDFs sem TOC ──
+    if not sec.get("sentenca") or not sec.get("dispositivo"):
+        linhas = txt.split("\n")
+        padroes_fallback = {
+            "sentenca":    r"VISTOS[,\s]+RELATADOS|VISTOS[,\s]+ETC",
+            "acordao":     r"A\s*C\s*[OÓ]\s*R\s*D\s*[AÃ]\s*O",
+            "dispositivo": r"(?:^|\n)\s*Condeno\b|JULGO\s+PROCED|ISTO\s+POSTO",
+        }
+        for nome, p in padroes_fallback.items():
+            if nome in sec: continue
+            for i in range(len(linhas)-1, -1, -1):
+                if re.search(p, linhas[i], re.IGNORECASE | re.MULTILINE):
+                    sec[nome] = "\n".join(linhas[i:i+600])
+                    break
+
+    # Ficha e ponto: busca textual (estrutura de tabela, não aparece no TOC tipo)
+    if not sec.get("ficha"):
+        linhas = txt.split("\n")
         for i, l in enumerate(linhas):
-            if re.search(p, l, re.IGNORECASE):
-                sec[nome] = "\n".join(linhas[i:i+600])
-                break
+            if re.search(r"FICHA FINANCEIRA|CONTRACHEQUE|HOLERITE", l, re.IGNORECASE):
+                sec["ficha"] = "\n".join(linhas[i:i+600]); break
+    if not sec.get("ponto"):
+        linhas = txt.split("\n")
+        for i, l in enumerate(linhas):
+            if re.search(r"CART[AÃ]O DE PONTO|ESPELHO DE PONTO", l, re.IGNORECASE):
+                sec["ponto"] = "\n".join(linhas[i:i+600]); break
+
     return sec
-
-
 # ── 1.3 Extrair decisões (sem IA — extração literal de texto) ─────────────────
 
 MARCADORES_TIPO = {
@@ -786,8 +844,8 @@ pdf_bytes = arq.read()
 dados = decisoes_lista = criterios = ficha = ponto = None
 
 with st.spinner("Lendo PDF..."):
-    doc_fitz, txt, npags = ler_pdf(pdf_bytes)
-    secs = buscar_secoes(txt)
+    doc_fitz, capa, txt, toc, npags = ler_pdf(pdf_bytes)
+    secs = buscar_secoes(doc_fitz, toc, txt)
 
 secoes_ok = list(secs.keys())
 st.write(f"✅ {npags} páginas lidas" +
@@ -795,7 +853,7 @@ st.write(f"✅ {npags} páginas lidas" +
 
 if f_dados:
     with st.spinner("Extraindo dados do processo (regex)..."):
-        dados = extrair_dados(txt)
+        dados = extrair_dados(txt, capa)
     num = dados.get("numero_processo","?")
     rec = dados.get("reclamante","?")
     emp = dados.get("reclamada_1","?")
