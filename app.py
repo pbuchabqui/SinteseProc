@@ -11,6 +11,8 @@ import streamlit as st
 from sintese.ai import ext_alertas_periciais, ext_criterios, montar_contexto_criterios
 from sintese.exporters import gerar_excel, gerar_markdown, gerar_word
 from sintese.extraction import (
+    aplicar_ocr_necessario,
+    analisar_pdf_texto,
     buscar_secoes,
     extrair_dados,
     extrair_decisoes,
@@ -92,11 +94,50 @@ dados = decisoes_lista = criterios = ficha = ponto = alertas = None
 
 with st.spinner("Lendo PDF..."):
     doc_fitz, capa, txt, toc, npags = ler_pdf(pdf_bytes)
-    secs = buscar_secoes(doc_fitz, toc, txt)
+    analise_pdf = analisar_pdf_texto(doc_fitz)
 
+st.write(f"✅ {npags} páginas lidas")
+
+if analise_pdf["total_precisam_ocr"]:
+    paginas_ocr = ", ".join(map(str, analise_pdf["paginas_precisam_ocr"][:20]))
+    extra = "..." if len(analise_pdf["paginas_precisam_ocr"]) > 20 else ""
+    st.warning(
+        f"🔎 Análise inicial: {analise_pdf['total_precisam_ocr']}/{npags} página(s) precisam de OCR "
+        f"(páginas {paginas_ocr}{extra})."
+    )
+    with st.spinner("Executando OCR nas páginas necessárias..."):
+        ocr = aplicar_ocr_necessario(doc_fitz, analise_pdf, pdf_bytes=pdf_bytes)
+    if ocr["paginas_processadas"]:
+        capa = ocr["capa"]
+        txt = ocr["texto_completo"]
+        engine = ocr.get("engine") or "ocr"
+        st.write(f"✅ OCR concluído em {len(ocr['paginas_processadas'])} página(s) — motor: {engine}")
+    if ocr["erros"]:
+        paginas_erro = ", ".join(map(str, sorted(ocr["erros"])[:10]))
+        extra_erro = "..." if len(ocr["erros"]) > 10 else ""
+        st.warning(
+            f"⚠️ OCR não concluiu em {len(ocr['erros'])} página(s): {paginas_erro}{extra_erro}. "
+            "Verifique se o Tesseract e o idioma português estão disponíveis."
+        )
+else:
+    st.write(
+        f"🔎 Análise inicial: texto nativo aproveitável em "
+        f"{analise_pdf['total_nativas']}/{npags} página(s) ({analise_pdf['percentual_nativo']}%)."
+    )
+
+if analise_pdf["total_baixo_texto"] or analise_pdf["total_sem_texto"]:
+    st.caption(
+        f"Páginas com baixo texto: {analise_pdf['total_baixo_texto']} — "
+        f"sem texto detectável: {analise_pdf['total_sem_texto']}."
+    )
+
+secs = buscar_secoes(doc_fitz, toc, txt)
 secoes_ok = list(secs.keys())
-st.write(f"✅ {npags} páginas lidas" +
-         (f" — seções: {', '.join(secoes_ok)}" if secoes_ok else " — nenhuma seção localizada por palavra-chave"))
+st.write(
+    "✅ Seções localizadas: " + ", ".join(secoes_ok)
+    if secoes_ok
+    else "⚠️ Nenhuma seção localizada por palavra-chave"
+)
 
 if f_dados:
     with st.spinner("Extraindo dados do processo (regex)..."):

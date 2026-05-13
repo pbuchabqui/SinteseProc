@@ -1,4 +1,13 @@
-from sintese.extraction import extrair_dados, extrair_decisao_de_doc
+import sintese.extraction as extraction
+from sintese.extraction import (
+    aplicar_ocr_necessario,
+    analisar_pdf_texto,
+    classificar_pagina_texto,
+    executar_ocr_paginas,
+    extrair_dados,
+    extrair_decisao_de_doc,
+    _formatar_intervalos_paginas,
+)
 
 
 def test_extrair_dados_basicos_de_texto_e_capa():
@@ -62,3 +71,192 @@ Intimem-se.
     assert "Intimem-se" in decisao["dispositivo"]
     assert "horas extras" in decisao["verbas_deferidas"]
     assert "FGTS" in decisao["verbas_deferidas"]
+
+
+def test_classificar_pagina_texto_identifica_texto_nativo():
+    texto = " ".join(["palavra"] * 30)
+
+    info = classificar_pagina_texto(texto, total_imagens=0)
+
+    assert info["status"] == "nativo"
+    assert info["precisa_ocr"] is False
+    assert info["palavras"] == 30
+
+
+def test_classificar_pagina_texto_identifica_pagina_escaneada():
+    info = classificar_pagina_texto("", total_imagens=1)
+
+    assert info["status"] == "precisa_ocr"
+    assert info["precisa_ocr"] is True
+    assert info["imagens"] == 1
+
+
+def test_classificar_pagina_texto_identifica_desenho_sem_texto_como_ocr():
+    info = classificar_pagina_texto("", total_imagens=0, total_desenhos=3)
+
+    assert info["status"] == "precisa_ocr"
+    assert info["precisa_ocr"] is True
+    assert info["desenhos"] == 3
+
+
+def test_analisar_pdf_texto_resume_pdf_misto():
+    class PaginaFake:
+        def __init__(self, texto, imagens):
+            self._texto = texto
+            self._imagens = imagens
+
+        def get_text(self):
+            return self._texto
+
+        def get_images(self, full=True):
+            return [object()] * self._imagens
+
+    paginas = [
+        PaginaFake(" ".join(["texto"] * 30), 0),
+        PaginaFake("", 1),
+        PaginaFake("rodape", 0),
+    ]
+
+    analise = analisar_pdf_texto(paginas)
+
+    assert analise["tipo_pdf"] == "misto"
+    assert analise["total_paginas"] == 3
+    assert analise["paginas_nativas"] == [1]
+    assert analise["paginas_precisam_ocr"] == [2]
+    assert analise["paginas_baixo_texto"] == [3]
+    assert analise["percentual_nativo"] == 33.3
+
+
+def test_aplicar_ocr_necessario_reconstroi_texto_com_paginas_processadas(monkeypatch):
+    class PaginaFake:
+        def __init__(self, texto):
+            self._texto = texto
+
+        def get_text(self):
+            return self._texto
+
+    class DocFake:
+        def __init__(self):
+            self.paginas = [PaginaFake("texto nativo pagina 1"), PaginaFake("")]
+
+        def __iter__(self):
+            return iter(self.paginas)
+
+        def __getitem__(self, index):
+            return self.paginas[index]
+
+    def fake_executar_ocr_paginas(doc, paginas, idioma="por+eng", dpi=300, pdf_bytes=None):
+        return {
+            "paginas_solicitadas": paginas,
+            "paginas_processadas": [2],
+            "textos_ocr": {2: "texto reconhecido por OCR"},
+            "erros": {},
+            "idioma": idioma,
+            "dpi": dpi,
+            "engine": "teste",
+        }
+
+    monkeypatch.setattr(extraction, "executar_ocr_paginas", fake_executar_ocr_paginas)
+
+    resultado = aplicar_ocr_necessario(
+        DocFake(),
+        {"paginas_precisam_ocr": [2]},
+    )
+
+    assert resultado["executado"] is True
+    assert resultado["paginas_processadas"] == [2]
+    assert resultado["capa"] == "texto nativo pagina 1"
+    assert "[PÁGINA 2]\ntexto reconhecido por OCR" in resultado["texto_completo"]
+
+
+def test_aplicar_ocr_necessario_atualiza_capa_quando_primeira_pagina_tem_ocr(monkeypatch):
+    class PaginaFake:
+        def get_text(self):
+            return ""
+
+    class DocFake:
+        def __iter__(self):
+            return iter([PaginaFake()])
+
+        def __getitem__(self, index):
+            return PaginaFake()
+
+    def fake_executar_ocr_paginas(doc, paginas, idioma="por+eng", dpi=300, pdf_bytes=None):
+        return {
+            "paginas_solicitadas": paginas,
+            "paginas_processadas": [1],
+            "textos_ocr": {1: "CAPA OCR RECLAMANTE: JOAO"},
+            "erros": {},
+            "idioma": idioma,
+            "dpi": dpi,
+            "engine": "teste",
+        }
+
+    monkeypatch.setattr(extraction, "executar_ocr_paginas", fake_executar_ocr_paginas)
+
+    resultado = aplicar_ocr_necessario(
+        DocFake(),
+        {"paginas_precisam_ocr": [1]},
+    )
+
+    assert resultado["capa"] == "CAPA OCR RECLAMANTE: JOAO"
+    assert resultado["texto_completo"] == "[PÁGINA 1]\nCAPA OCR RECLAMANTE: JOAO"
+
+
+def test_formatar_intervalos_paginas_compacta_ranges():
+    assert _formatar_intervalos_paginas([1, 2, 3, 5, 7, 8]) == "1-3,5,7-8"
+
+
+def test_executar_ocr_paginas_faz_fallback_quando_ocrmypdf_falha(monkeypatch):
+    class PaginaFake:
+        def get_textpage_ocr(self, language="por+eng", dpi=300, full=True):
+            return object()
+
+        def get_text(self, kind="text", textpage=None):
+            return "texto fallback"
+
+    class DocFake:
+        def __getitem__(self, index):
+            return PaginaFake()
+
+    monkeypatch.setattr(extraction.shutil, "which", lambda cmd: "/usr/bin/ocrmypdf")
+    monkeypatch.setattr(
+        extraction,
+        "executar_ocr_paginas_ocrmypdf",
+        lambda *args, **kwargs: {
+            "paginas_solicitadas": [1],
+            "paginas_processadas": [],
+            "textos_ocr": {},
+            "erros": {1: "falhou"},
+            "engine": "ocrmypdf",
+        },
+    )
+
+    resultado = executar_ocr_paginas(DocFake(), [1, 2, 3], pdf_bytes=b"%PDF")
+
+    assert resultado["engine"] == "pymupdf_tesseract"
+    assert resultado["textos_ocr"] == {
+        1: "texto fallback",
+        2: "texto fallback",
+        3: "texto fallback",
+    }
+
+
+def test_executar_ocr_paginas_prefere_ocrmypdf_quando_disponivel(monkeypatch):
+    monkeypatch.setattr(extraction.shutil, "which", lambda cmd: "/usr/bin/ocrmypdf")
+    monkeypatch.setattr(
+        extraction,
+        "executar_ocr_paginas_ocrmypdf",
+        lambda *args, **kwargs: {
+            "paginas_solicitadas": [1],
+            "paginas_processadas": [1],
+            "textos_ocr": {1: "texto acurado"},
+            "erros": {},
+            "engine": "ocrmypdf",
+        },
+    )
+
+    resultado = executar_ocr_paginas(object(), [1], pdf_bytes=b"%PDF")
+
+    assert resultado["engine"] == "ocrmypdf"
+    assert resultado["textos_ocr"] == {1: "texto acurado"}

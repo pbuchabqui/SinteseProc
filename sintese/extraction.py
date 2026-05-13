@@ -1,8 +1,21 @@
 """Deterministic PDF and text extraction helpers for SinteseProc."""
 
+import os
 import re
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
 
 import fitz
+
+MIN_CHARS_TEXTO_NATIVO = 80
+MIN_PALAVRAS_TEXTO_NATIVO = 15
+IDIOMA_OCR_PADRAO = "por+eng"
+OCR_DPI_PADRAO = 300
+OCR_JOBS_MAX = 4
+OCRMY_PDF_MIN_PAGINAS = 1
+
 
 def ler_pdf(b: bytes) -> tuple[fitz.Document, str, str, list, int]:
     """Abre o PDF e retorna (doc, capa, texto_completo, toc, total_paginas).
@@ -10,10 +23,317 @@ def ler_pdf(b: bytes) -> tuple[fitz.Document, str, str, list, int]:
     toc  = sumário estruturado do PDF (lista de [nivel, titulo, pagina]).
     """
     doc = fitz.open(stream=b, filetype="pdf")
-    capa = doc[0].get_text() if len(doc) > 0 else ""
+    textos_paginas = extrair_textos_paginas(doc)
+    capa = textos_paginas[0] if textos_paginas else ""
     toc  = doc.get_toc()  # sumário embutido — disponível em todos os PDFs PJe
-    paginas = [f"[PÁGINA {i+1}]\n{p.get_text()}" for i, p in enumerate(doc)]
-    return doc, capa, "\n".join(paginas), toc, len(paginas)
+    return doc, capa, juntar_textos_paginas(textos_paginas), toc, len(textos_paginas)
+
+
+def extrair_textos_paginas(doc: fitz.Document) -> list[str]:
+    return [p.get_text() for p in doc]
+
+
+def juntar_textos_paginas(textos_paginas: list[str]) -> str:
+    paginas = [f"[PÁGINA {i+1}]\n{texto}" for i, texto in enumerate(textos_paginas)]
+    return "\n".join(paginas)
+
+
+def classificar_pagina_texto(
+    texto: str,
+    total_imagens: int,
+    total_desenhos: int = 0,
+    min_chars: int = MIN_CHARS_TEXTO_NATIVO,
+    min_palavras: int = MIN_PALAVRAS_TEXTO_NATIVO,
+) -> dict:
+    """Classifica a camada textual de uma página para decidir se OCR é necessário."""
+    texto_limpo = re.sub(r"\s+", " ", texto or "").strip()
+    palavras = re.findall(r"\w+", texto_limpo, re.UNICODE)
+    total_chars = len(texto_limpo)
+    total_palavras = len(palavras)
+
+    tem_conteudo_visual = total_imagens > 0 or total_desenhos > 0
+
+    if total_chars >= min_chars and total_palavras >= min_palavras:
+        status = "nativo"
+        precisa_ocr = False
+    elif tem_conteudo_visual and total_palavras < min_palavras:
+        status = "precisa_ocr"
+        precisa_ocr = True
+    elif total_chars == 0:
+        status = "sem_texto"
+        precisa_ocr = False
+    else:
+        status = "baixo_texto"
+        precisa_ocr = False
+
+    return {
+        "status": status,
+        "precisa_ocr": precisa_ocr,
+        "chars": total_chars,
+        "palavras": total_palavras,
+        "imagens": total_imagens,
+        "desenhos": total_desenhos,
+    }
+
+
+def analisar_pdf_texto(doc: fitz.Document) -> dict:
+    """Analisa se o PDF tem texto nativo aproveitável ou páginas que pedem OCR."""
+    detalhes = []
+    for idx, pagina in enumerate(doc, 1):
+        texto = pagina.get_text()
+        try:
+            total_imagens = len(pagina.get_images(full=True))
+        except Exception:
+            total_imagens = 0
+        try:
+            total_desenhos = len(pagina.get_drawings())
+        except Exception:
+            total_desenhos = 0
+        info = classificar_pagina_texto(texto, total_imagens, total_desenhos)
+        info["pagina"] = idx
+        detalhes.append(info)
+
+    total = len(detalhes)
+    paginas_nativas = [p["pagina"] for p in detalhes if p["status"] == "nativo"]
+    paginas_precisam_ocr = [p["pagina"] for p in detalhes if p["precisa_ocr"]]
+    paginas_baixo_texto = [p["pagina"] for p in detalhes if p["status"] == "baixo_texto"]
+    paginas_sem_texto = [p["pagina"] for p in detalhes if p["status"] == "sem_texto"]
+
+    if total == 0:
+        tipo_pdf = "vazio"
+    elif len(paginas_precisam_ocr) == total:
+        tipo_pdf = "escaneado"
+    elif paginas_precisam_ocr:
+        tipo_pdf = "misto"
+    elif len(paginas_nativas) == total:
+        tipo_pdf = "nativo"
+    else:
+        tipo_pdf = "baixo_texto"
+
+    return {
+        "tipo_pdf": tipo_pdf,
+        "total_paginas": total,
+        "total_nativas": len(paginas_nativas),
+        "total_precisam_ocr": len(paginas_precisam_ocr),
+        "total_baixo_texto": len(paginas_baixo_texto),
+        "total_sem_texto": len(paginas_sem_texto),
+        "percentual_nativo": round((len(paginas_nativas) / total) * 100, 1) if total else 0.0,
+        "paginas_nativas": paginas_nativas,
+        "paginas_precisam_ocr": paginas_precisam_ocr,
+        "paginas_baixo_texto": paginas_baixo_texto,
+        "paginas_sem_texto": paginas_sem_texto,
+        "detalhes_paginas": detalhes,
+    }
+
+
+def executar_ocr_paginas(
+    doc: fitz.Document,
+    paginas: list[int],
+    idioma: str = IDIOMA_OCR_PADRAO,
+    dpi: int = OCR_DPI_PADRAO,
+    pdf_bytes: bytes | None = None,
+    preferir_ocrmypdf: bool = True,
+) -> dict:
+    """Executa OCR nas páginas informadas e retorna texto extraído por página."""
+    paginas_unicas = sorted(set(paginas))
+    if (
+        preferir_ocrmypdf
+        and pdf_bytes
+        and len(paginas_unicas) >= OCRMY_PDF_MIN_PAGINAS
+        and shutil.which("ocrmypdf")
+    ):
+        resultado = executar_ocr_paginas_ocrmypdf(
+            pdf_bytes,
+            paginas_unicas,
+            idioma=idioma,
+            dpi=dpi,
+        )
+        if resultado["paginas_processadas"]:
+            return resultado
+
+    return executar_ocr_paginas_pymupdf(doc, paginas, idioma=idioma, dpi=dpi)
+
+
+def executar_ocr_paginas_pymupdf(
+    doc: fitz.Document,
+    paginas: list[int],
+    idioma: str = IDIOMA_OCR_PADRAO,
+    dpi: int = OCR_DPI_PADRAO,
+) -> dict:
+    """Executa OCR página a página via PyMuPDF/Tesseract."""
+    textos_ocr = {}
+    erros = {}
+
+    for pagina_num in paginas:
+        try:
+            pagina = doc[pagina_num - 1]
+            textpage = pagina.get_textpage_ocr(language=idioma, dpi=dpi, full=True)
+            texto = pagina.get_text("text", textpage=textpage)
+            textos_ocr[pagina_num] = texto or ""
+        except Exception as exc:
+            erros[pagina_num] = str(exc)
+
+    return {
+        "paginas_solicitadas": paginas,
+        "paginas_processadas": sorted(textos_ocr),
+        "textos_ocr": textos_ocr,
+        "erros": erros,
+        "idioma": idioma,
+        "dpi": dpi,
+        "engine": "pymupdf_tesseract",
+    }
+
+
+def executar_ocr_paginas_ocrmypdf(
+    pdf_bytes: bytes,
+    paginas: list[int],
+    idioma: str = IDIOMA_OCR_PADRAO,
+    dpi: int = OCR_DPI_PADRAO,
+    jobs: int | None = None,
+) -> dict:
+    """Executa OCR com OCRmyPDF, preferindo acurácia e paralelismo."""
+    paginas = sorted(set(paginas))
+    if not paginas:
+        return {
+            "paginas_solicitadas": [],
+            "paginas_processadas": [],
+            "textos_ocr": {},
+            "erros": {},
+            "idioma": idioma,
+            "dpi": dpi,
+            "engine": "ocrmypdf",
+        }
+
+    jobs = jobs or min(max(os.cpu_count() or 1, 1), OCR_JOBS_MAX)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        entrada = tmp / "entrada.pdf"
+        saida = tmp / "saida.pdf"
+        entrada.write_bytes(pdf_bytes)
+
+        cmd = [
+            "ocrmypdf",
+            "--quiet",
+            "--force-ocr",
+            "--deskew",
+            "--rotate-pages",
+            "--rotate-pages-threshold",
+            "2",
+            "--oversample",
+            str(dpi),
+            "--jobs",
+            str(jobs),
+            "--pages",
+            _formatar_intervalos_paginas(paginas),
+            "--output-type",
+            "pdf",
+            "-l",
+            idioma,
+            str(entrada),
+            str(saida),
+        ]
+
+        proc = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=max(60, len(paginas) * 45),
+        )
+        if proc.returncode != 0 or not saida.exists():
+            erro = (proc.stderr or proc.stdout or "OCRmyPDF falhou sem mensagem.").strip()
+            return {
+                "paginas_solicitadas": paginas,
+                "paginas_processadas": [],
+                "textos_ocr": {},
+                "erros": {p: erro for p in paginas},
+                "idioma": idioma,
+                "dpi": dpi,
+                "engine": "ocrmypdf",
+            }
+
+        textos_ocr = {}
+        erros = {}
+        with fitz.open(str(saida)) as doc_ocr:
+            for pagina_num in paginas:
+                try:
+                    textos_ocr[pagina_num] = doc_ocr[pagina_num - 1].get_text() or ""
+                except Exception as exc:
+                    erros[pagina_num] = str(exc)
+
+        return {
+            "paginas_solicitadas": paginas,
+            "paginas_processadas": sorted(textos_ocr),
+            "textos_ocr": textos_ocr,
+            "erros": erros,
+            "idioma": idioma,
+            "dpi": dpi,
+            "engine": "ocrmypdf",
+            "jobs": jobs,
+        }
+
+
+def _formatar_intervalos_paginas(paginas: list[int]) -> str:
+    paginas = sorted(set(paginas))
+    intervalos = []
+    inicio = fim = paginas[0]
+
+    for pagina in paginas[1:]:
+        if pagina == fim + 1:
+            fim = pagina
+            continue
+        intervalos.append(f"{inicio}-{fim}" if inicio != fim else str(inicio))
+        inicio = fim = pagina
+
+    intervalos.append(f"{inicio}-{fim}" if inicio != fim else str(inicio))
+    return ",".join(intervalos)
+
+
+def aplicar_ocr_necessario(
+    doc: fitz.Document,
+    analise_pdf: dict,
+    pdf_bytes: bytes | None = None,
+    idioma: str = IDIOMA_OCR_PADRAO,
+    dpi: int = OCR_DPI_PADRAO,
+) -> dict:
+    """Executa OCR nas páginas sinalizadas e reconstrói capa/texto completo."""
+    paginas = list(analise_pdf.get("paginas_precisam_ocr") or [])
+    textos_paginas = extrair_textos_paginas(doc)
+
+    if not paginas:
+        return {
+            "executado": False,
+            "paginas_processadas": [],
+            "erros": {},
+            "textos_paginas": textos_paginas,
+            "capa": textos_paginas[0] if textos_paginas else "",
+            "texto_completo": juntar_textos_paginas(textos_paginas),
+        }
+
+    resultado = executar_ocr_paginas(
+        doc,
+        paginas,
+        idioma=idioma,
+        dpi=dpi,
+        pdf_bytes=pdf_bytes,
+    )
+    for pagina_num, texto in resultado["textos_ocr"].items():
+        if texto.strip() and 1 <= pagina_num <= len(textos_paginas):
+            textos_paginas[pagina_num - 1] = texto
+
+    return {
+        "executado": True,
+        "paginas_processadas": resultado["paginas_processadas"],
+        "erros": resultado["erros"],
+        "textos_paginas": textos_paginas,
+        "capa": textos_paginas[0] if textos_paginas else "",
+        "texto_completo": juntar_textos_paginas(textos_paginas),
+        "idioma": idioma,
+        "dpi": dpi,
+        "engine": resultado.get("engine"),
+        "jobs": resultado.get("jobs"),
+    }
 
 
 # ── 1.1 Dados do processo (regex) ────────────────────────────────────────────
