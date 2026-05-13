@@ -1,6 +1,7 @@
 """
 app.py — Síntese de Decisões Trabalhista
-Saídas: Word (.docx) | Markdown (.md) | Excel (.xlsx)
+IA usada APENAS para critérios de liquidação (interpretação jurídica).
+Todo o resto é regex + PyMuPDF (determinístico, rápido, sem custo).
 """
 
 import io, json, re
@@ -14,7 +15,8 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
+
 st.set_page_config(page_title="Síntese de Decisões", page_icon="⚖️")
 st.title("⚖️ Síntese de Decisões Trabalhista")
 st.caption("Upload PDF → extrair → baixar Word / Markdown / Excel")
@@ -29,24 +31,114 @@ if not GROQ_KEY:
     st.error("GROQ_API_KEY não configurada. Adicione em Settings → Secrets.")
     st.stop()
 
-# ── PDF ───────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# BLOCO 1 — EXTRAÇÃO DETERMINÍSTICA (sem IA)
+# ══════════════════════════════════════════════════════════════════════════════
 
-def ler_pdf(b: bytes):
+def ler_pdf(b: bytes) -> tuple[fitz.Document, str, int]:
+    """Abre o PDF e retorna (doc, texto_completo, total_paginas)."""
     doc = fitz.open(stream=b, filetype="pdf")
-    pags = [f"[PÁGINA {i+1}]\n{p.get_text()}" for i, p in enumerate(doc)]
-    doc.close()
-    return "\n".join(pags), len(pags)
+    paginas = [f"[PÁGINA {i+1}]\n{p.get_text()}" for i, p in enumerate(doc)]
+    return doc, "\n".join(paginas), len(paginas)
 
-def buscar_secoes(txt: str):
+
+# ── 1.1 Dados do processo (regex) ────────────────────────────────────────────
+
+def extrair_dados(txt: str) -> dict:
     """
-    Decisões ficam no FINAL do processo — busca de trás pra frente.
+    Extrai por regex todos os campos com padrão fixo.
+    Sem IA — padrões CNJ/TRT são determinísticos.
+    """
+    def primeiro(padrao, texto=txt, grupo=0):
+        m = re.search(padrao, texto, re.IGNORECASE)
+        return m.group(grupo) if m else None
+
+    def todos(padrao, texto=txt):
+        return re.findall(padrao, texto, re.IGNORECASE)
+
+    # Número do processo (padrão CNJ obrigatório)
+    numero = primeiro(r"\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}")
+
+    # Vara do trabalho
+    vara = primeiro(
+        r"(\d+[ªº°]?\s*VARA\s+DO\s+TRABALHO[^\n]*)",
+        grupo=1
+    ) or primeiro(r"(VARA\s+DO\s+TRABALHO[^\n]*)", grupo=1)
+
+    # CPF (reclamante — primeiro encontrado)
+    cpf = primeiro(r"\d{3}[\.\-]?\d{3}[\.\-]?\d{3}[\-]?\d{2}")
+
+    # CNPJ (reclamada — primeiro encontrado)
+    cnpj = primeiro(r"\d{2}[\.\-]?\d{3}[\.\-]?\d{3}[\/]?\d{4}[\-]?\d{2}")
+
+    # OABs (pode haver vários)
+    oabs = todos(r"OAB[/\s]*[A-Z]{2}[/\s#nº°.]*\s*[\d\.]+")
+
+    # Datas — busca por labels próximos
+    def data_apos_label(labels):
+        for label in labels:
+            m = re.search(
+                rf"{label}[^\d]*(\d{{2}}/\d{{2}}/\d{{4}})",
+                txt, re.IGNORECASE
+            )
+            if m: return m.group(1)
+        return None
+
+    data_admissao   = data_apos_label(["admiss[aã]o", "admitido", "contratad"])
+    data_demissao   = data_apos_label(["demiss[aã]o", "despedid", "rescis[aã]o", "desligad"])
+    data_ajuizamento = data_apos_label(["ajuizamento", "distribui[çc][aã]o", "protocolo"])
+
+    # Nomes das partes — após labels padrão TRT
+    def nome_apos_label(labels):
+        for label in labels:
+            m = re.search(
+                rf"(?:^|\n){label}[:\s]+([A-ZÁÉÍÓÚÂÊÎÔÛÃÕÀÈÌÒÙÇ][^\n]{{3,80}})",
+                txt, re.IGNORECASE | re.MULTILINE
+            )
+            if m:
+                nome = m.group(1).strip().rstrip(".,;")
+                # Filtra linhas que são claramente não-nomes
+                if not re.search(r"CPF|CNPJ|OAB|Rua|Av\.|processo", nome, re.IGNORECASE):
+                    return nome
+        return None
+
+    reclamante = nome_apos_label([
+        "RECLAMANTE", "AUTOR", "EXEQUENTE", "REQUERENTE"
+    ])
+    reclamada = nome_apos_label([
+        "RECLAMADA", "R[EÉ]U", "EXECUTADA", "REQUERIDA", "EMPRESA"
+    ])
+
+    # Advogados — nome após "Dr." / "Dra." próximo a OAB
+    advs = todos(r"Dr[a]?\.\s+([A-ZÁÉÍÓÚÂÊÎÔÛÃÕ][a-záéíóúâêîôûãõ\s]{5,50})")
+
+    return {
+        "numero_processo":  numero or "Não localizado",
+        "vara_trabalho":    vara,
+        "reclamante":       reclamante,
+        "cpf_reclamante":   cpf,
+        "reclamada_1":      reclamada,
+        "cnpj_reclamada_1": cnpj,
+        "oabs":             oabs,
+        "adv_reclamante":   advs[0] if len(advs) > 0 else None,
+        "adv_reclamada_1":  advs[1] if len(advs) > 1 else None,
+        "data_admissao":    data_admissao,
+        "data_demissao":    data_demissao,
+        "data_ajuizamento": data_ajuizamento,
+    }
+
+
+# ── 1.2 Localizar seções (busca bidirecional) ─────────────────────────────────
+
+def buscar_secoes(txt: str) -> dict:
+    """
+    Decisões ficam no FINAL — busca de trás pra frente.
     Ficha e ponto ficam no início/meio — busca normal.
-    Captura até 600 linhas por seção.
     """
     padroes_fim = {
         "sentenca":    r"S\s*E\s*N\s*T\s*E\s*N\s*[CÇ]\s*A|VISTOS[,\s]+RELATADOS|VISTOS E JULGADOS",
         "acordao":     r"A\s*C\s*[OÓ]\s*R\s*D\s*[AÃ]\s*O",
-        "dispositivo": r"ISTO POSTO|DIANTE DO EXPOSTO|PELO EXPOSTO|DECIDO[:\s]|DECIDE-SE",
+        "dispositivo": r"^(ISTO POSTO|DIANTE DO EXPOSTO|PELO EXPOSTO|DECIDO|DECIDE-SE)",
     }
     padroes_inicio = {
         "ficha": r"FICHA FINANCEIRA|CONTRACHEQUE|HOLERITE|FOLHA DE PAGAMENTO",
@@ -54,13 +146,11 @@ def buscar_secoes(txt: str):
     }
     linhas = txt.split("\n")
     sec = {}
-    # Busca de trás pra frente para decisões
     for nome, p in padroes_fim.items():
         for i in range(len(linhas)-1, -1, -1):
-            if re.search(p, linhas[i], re.IGNORECASE):
+            if re.search(p, linhas[i], re.IGNORECASE | re.MULTILINE):
                 sec[nome] = "\n".join(linhas[i:i+600])
                 break
-    # Busca normal para documentos contábeis
     for nome, p in padroes_inicio.items():
         for i, l in enumerate(linhas):
             if re.search(p, l, re.IGNORECASE):
@@ -68,21 +158,280 @@ def buscar_secoes(txt: str):
                 break
     return sec
 
-def dados_basicos(txt: str):
-    m = re.search(r"\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}", txt)
-    return {"numero_processo": m.group() if m else "Não localizado"}
 
-# ── IA (Groq) ─────────────────────────────────────────────────────────────────
+# ── 1.3 Extrair decisões (sem IA — extração literal de texto) ─────────────────
+
+MARCADORES_TIPO = {
+    "Sentença":              r"S\s*E\s*N\s*T\s*E\s*N\s*[CÇ]\s*A|VISTOS[,\s]+RELATADOS",
+    "Acórdão":               r"A\s*C\s*[OÓ]\s*R\s*D\s*[AÃ]\s*O",
+    "Embargos de Declaração":r"EMBARGOS\s+DE\s+DECLARA[CÇ][AÃ]O",
+}
+MARCADORES_DISPOSITIVO = [
+    r"ISTO\s+POSTO", r"DIANTE\s+DO\s+EXPOSTO", r"PELO\s+EXPOSTO",
+    r"DECIDO\s*[:;]", r"DECIDE-SE", r"JULGO",
+]
+MARCADORES_FIM_DISPOSITIVO = [
+    r"Intimem-se", r"Cumpra-se", r"Publique-se", r"Registre-se",
+    r"Após\s+o\s+trânsito", r"P\.R\.I", r"Intime-se",
+]
+VERBAS_CONHECIDAS = [
+    "horas extras", "adicional noturno", "adicional de periculosidade",
+    "adicional de insalubridade", "férias", "13º salário", "aviso prévio",
+    "FGTS", "multa do art. 477", "multa do art. 467", "dano moral",
+    "dano material", "diferenças salariais", "equiparação salarial",
+    "intervalo intrajornada", "DSR", "vale-transporte", "vale-alimentação",
+    "horas in itinere", "sobreaviso", "prontidão",
+]
+
+def extrair_decisoes(txt: str) -> list[dict]:
+    """
+    Extrai decisões por padrão de texto, sem IA.
+    - Tipo: regex no cabeçalho da seção
+    - Data: regex (dd/mm/aaaa)
+    - Dispositivo: extração literal entre marcador e fim
+    - Resultado: keyword search
+    - Verbas: lista pré-definida
+    """
+    decisoes = []
+    linhas = txt.split("\n")
+
+    i = 0
+    while i < len(linhas):
+        linha = linhas[i]
+
+        # Detectar início de uma decisão
+        tipo_encontrado = None
+        for tipo, padrao in MARCADORES_TIPO.items():
+            if re.search(padrao, linha, re.IGNORECASE):
+                tipo_encontrado = tipo
+                break
+
+        if not tipo_encontrado:
+            i += 1
+            continue
+
+        # Janela de até 600 linhas a partir do marcador
+        janela = linhas[i:i+600]
+        bloco  = "\n".join(janela)
+
+        # Data — primeira dd/mm/aaaa na janela
+        m_data = re.search(r"\d{2}/\d{2}/\d{4}", bloco)
+        data = m_data.group() if m_data else None
+
+        # Dispositivo — do marcador até o fim
+        dispositivo = ""
+        inicio_disp = None
+        for j, l in enumerate(janela):
+            if any(re.search(p, l, re.IGNORECASE) for p in MARCADORES_DISPOSITIVO):
+                inicio_disp = j
+                break
+
+        if inicio_disp is not None:
+            linhas_disp = []
+            for l in janela[inicio_disp:]:
+                if any(re.search(p, l, re.IGNORECASE) for p in MARCADORES_FIM_DISPOSITIVO):
+                    linhas_disp.append(l)
+                    break
+                linhas_disp.append(l)
+            dispositivo = "\n".join(linhas_disp).strip()
+
+        # Resultado — keyword
+        resultado = "parcialmente procedente"  # default TRT
+        if re.search(r"JULGO\s+IMPROCEDENTE|pedidos?\s+improcedentes?", bloco, re.IGNORECASE):
+            resultado = "improcedente"
+        elif re.search(r"JULGO\s+PROCEDENTE[^S]|pedidos?\s+procedentes?[^S]", bloco, re.IGNORECASE):
+            resultado = "procedente"
+        elif re.search(r"parcialmente|em\s+parte", bloco, re.IGNORECASE):
+            resultado = "parcialmente procedente"
+
+        # Verbas — lista pré-definida
+        verbas = [v for v in VERBAS_CONHECIDAS
+                  if re.search(re.escape(v), bloco, re.IGNORECASE)]
+
+        if dispositivo or tipo_encontrado:
+            decisoes.append({
+                "tipo":                   tipo_encontrado,
+                "data":                   data,
+                "dispositivo":            dispositivo or "(dispositivo não localizado)",
+                "resultado_reclamante":   resultado,
+                "verbas_deferidas":       verbas,
+            })
+            i += 400  # pular para depois desta decisão
+        else:
+            i += 1
+
+    return decisoes
+
+
+# ── 1.4 Ficha financeira (PyMuPDF tabelas — sem IA) ───────────────────────────
+
+def extrair_ficha(doc: fitz.Document) -> dict:
+    """
+    Extrai ficha financeira usando detecção de tabelas do PyMuPDF.
+    Sem IA — dados tabulares são determinísticos.
+    """
+    rubricas_set = set()
+    competencias = []
+
+    for pagina in doc:
+        texto_pag = pagina.get_text()
+        # Verificar se esta página tem ficha financeira
+        if not re.search(
+            r"FICHA FINANCEIRA|CONTRACHEQUE|HOLERITE|FOLHA DE PAGAMENTO",
+            texto_pag, re.IGNORECASE
+        ):
+            continue
+
+        try:
+            tabelas = pagina.find_tables()
+        except Exception:
+            continue
+
+        for tabela in tabelas:
+            try:
+                linhas = tabela.extract()
+            except Exception:
+                continue
+            if not linhas or len(linhas) < 2:
+                continue
+
+            cabecalho = [str(c).strip() if c else "" for c in linhas[0]]
+
+            # Detectar coluna de competência
+            col_comp = next(
+                (i for i, c in enumerate(cabecalho)
+                 if re.search(r"compet[êe]ncia|m[êe]s|per[íi]odo", c, re.IGNORECASE)),
+                0
+            )
+
+            for linha in linhas[1:]:
+                if not linha or not any(linha):
+                    continue
+                comp_val = str(linha[col_comp]).strip() if linha[col_comp] else ""
+                if not re.search(r"\d{2}/\d{4}|\d{4}", comp_val):
+                    continue
+
+                valores = {}
+                for ci, cel in enumerate(linha):
+                    if ci == col_comp: continue
+                    nome_col = cabecalho[ci] if ci < len(cabecalho) else f"col_{ci}"
+                    if not nome_col: continue
+                    val_str = str(cel).strip() if cel else ""
+                    # Tentar converter para float
+                    val_num = None
+                    try:
+                        val_num = float(
+                            val_str.replace(".", "").replace(",", ".").replace("R$","").strip()
+                        )
+                    except (ValueError, AttributeError):
+                        pass
+                    if val_str:
+                        rubricas_set.add(nome_col)
+                        valores[nome_col] = {"referencia": "", "valor": val_num or val_str}
+
+                if valores:
+                    competencias.append({
+                        "competencia": comp_val,
+                        "valores": valores,
+                        "total_proventos": None,
+                        "inss_base": None,
+                        "inss_desconto": None,
+                        "fgts_base": None,
+                    })
+
+    if not competencias:
+        return {"erro": "Ficha não localizada ou sem tabelas detectáveis no PDF"}
+
+    return {"rubricas": sorted(rubricas_set), "competencias": competencias}
+
+
+# ── 1.5 Espelho de ponto (PyMuPDF tabelas — sem IA) ───────────────────────────
+
+def extrair_ponto(doc: fitz.Document) -> dict:
+    """
+    Extrai espelho de ponto usando detecção de tabelas do PyMuPDF.
+    Sem IA — dados tabulares são determinísticos.
+    """
+    registros = []
+    DIAS = {"SEG","TER","QUA","QUI","SEX","SÁB","SAB","DOM"}
+
+    for pagina in doc:
+        texto_pag = pagina.get_text()
+        if not re.search(
+            r"CART[AÃ]O DE PONTO|ESPELHO DE PONTO|REGISTRO DE PONTO",
+            texto_pag, re.IGNORECASE
+        ):
+            continue
+
+        try:
+            tabelas = pagina.find_tables()
+        except Exception:
+            continue
+
+        for tabela in tabelas:
+            try:
+                linhas = tabela.extract()
+            except Exception:
+                continue
+            if not linhas or len(linhas) < 2:
+                continue
+
+            for linha in linhas[1:]:
+                if not linha: continue
+                celulas = [str(c).strip() if c else "" for c in linha]
+
+                # Identificar célula de data
+                data = next(
+                    (c for c in celulas if re.match(r"\d{2}/\d{2}/\d{4}", c)),
+                    None
+                )
+                if not data: continue
+
+                # Dia da semana
+                dia = next((c for c in celulas if c.upper() in DIAS), "")
+
+                # Horários (HH:MM)
+                horarios = [c for c in celulas if re.match(r"\d{2}:\d{2}", c)]
+
+                # Horas trabalhadas e extras (último par de HH:MM costuma ser totais)
+                ht = horarios[-2] if len(horarios) >= 2 else ""
+                he = horarios[-1] if len(horarios) >= 1 else ""
+
+                # Observação
+                obs = next(
+                    (c for c in celulas
+                     if re.search(r"DSR|FALTA|FERIADO|FOLGA|AFASTAMENTO|FÉRIAS", c, re.IGNORECASE)),
+                    ""
+                )
+
+                registros.append({
+                    "data":             data,
+                    "dia_semana":       dia,
+                    "entradas_saidas":  horarios[:-2] if len(horarios) > 2 else horarios,
+                    "horas_trabalhadas":ht,
+                    "horas_extras":     he,
+                    "observacao":       obs,
+                })
+
+    if not registros:
+        return {"erro": "Ponto não localizado ou sem tabelas detectáveis no PDF"}
+
+    return {"registros": registros}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BLOCO 2 — IA (apenas critérios de liquidação)
+# ══════════════════════════════════════════════════════════════════════════════
 
 MODELO_RACIOCINIO = "openai/gpt-oss-120b"
 
-def ia(txt: str, instrucao: str, limite: int = 30000) -> dict:
+def chamar_ia(txt: str, instrucao: str, limite: int = 30000) -> dict:
+    """Chamada única ao Groq — usada apenas para critérios de liquidação."""
     modelo = get_secret("GROQ_MODEL") or "llama-3.3-70b-versatile"
     usa_raciocinio = modelo == MODELO_RACIOCINIO
 
     params = dict(
-        model=modelo,
-        stream=False,
+        model=modelo, stream=False,
         messages=[
             {"role":"system","content":(
                 "Você é perito contábil trabalhista brasileiro. "
@@ -91,72 +440,60 @@ def ia(txt: str, instrucao: str, limite: int = 30000) -> dict:
         ]
     )
     if usa_raciocinio:
-        params["max_completion_tokens"] = 3000
-        params["temperature"]           = 0.6
-        params["top_p"]                 = 1
-        params["reasoning_effort"]      = get_secret("GROQ_REASONING_EFFORT") or "medium"
+        params.update({"max_completion_tokens":3000,"temperature":0.6,"top_p":1,
+                       "reasoning_effort": get_secret("GROQ_REASONING_EFFORT") or "medium"})
     else:
-        params["max_tokens"]  = 3000
-        params["temperature"] = 0.1
+        params.update({"max_tokens":3000,"temperature":0.1})
 
     try:
         r   = Groq(api_key=GROQ_KEY).chat.completions.create(**params)
         raw = r.choices[0].message.content
-        try:
-            return json.loads(re.sub(r"```(?:json)?|```","",raw).strip())
-        except json.JSONDecodeError:
-            return {"erro": "JSON inválido", "texto_bruto": raw}
+        return json.loads(re.sub(r"```(?:json)?|```","",raw).strip())
+    except json.JSONDecodeError:
+        return {"erro": "JSON inválido", "texto_bruto": raw}
     except Exception as e:
         msg = str(e)
         if "rate_limit" in msg.lower() or "429" in msg:
-            return {"erro": "Rate limit atingido. Aguarde 1 minuto e tente novamente.", "detalhe": msg}
-        if "tokens" in msg.lower() or "context" in msg.lower():
-            return {"erro": "Texto muito longo para o modelo. Tente com um PDF menor.", "detalhe": msg}
+            return {"erro": "Rate limit atingido. Aguarde 1 minuto e tente novamente."}
         return {"erro": f"Erro na API: {msg}"}
 
-def ext_partes(txt):
-    # Partes ficam no início — 15k chars é suficiente
-    return ia(txt,"""Extraia do texto do processo trabalhista:
-{"reclamante":"nome","cpf_reclamante":"000.000.000-00","adv_reclamante":"nome",
-"oab_reclamante":"OAB/XX 00000","reclamada_1":"razão social","cnpj_reclamada_1":"",
-"adv_reclamada_1":"nome","reclamada_2":"ou null","vara_trabalho":"ex: 1ª VT Porto Alegre/RS",
-"data_admissao":"dd/mm/aaaa","data_demissao":"dd/mm/aaaa","data_ajuizamento":"dd/mm/aaaa",
-"funcao":"cargo"}""", limite=15000)
 
-def ext_decisoes(txt):
-    # Decisões podem ser longas — 40k chars
-    return ia(txt,"""Extraia as decisões judiciais. Transcreva LITERALMENTE o dispositivo.
-{"decisoes":[{"tipo":"Sentença|Acórdão|Embargos","data":"dd/mm/aaaa",
-"dispositivo":"texto literal completo","resultado_reclamante":"procedente|improcedente|parcialmente",
-"verbas_deferidas":["lista"]}]}""", limite=40000)
+def ext_criterios(dispositivo: str) -> dict:
+    """
+    Única chamada de IA no sistema.
+    Interpreta o dispositivo da sentença para extrair parâmetros de liquidação.
+    Isso exige compreensão semântica — regex não resolve.
+    """
+    return chamar_ia(dispositivo, """
+Analise o dispositivo da sentença/acórdão trabalhista e extraia os critérios de liquidação.
 
-def ext_criterios(txt):
-    # Critérios estão no dispositivo — 30k chars
-    return ia(txt,"""Extraia os critérios de liquidação.
-{"criterios":{"base_salarial":"","periodo_apurado":{"inicio":"dd/mm/aaaa","fim":"dd/mm/aaaa"},
-"jornada_contratual":"","jornada_real_apurada":"","divisor":"220|200|outro",
-"adicional_horas_extras":"50%|100%","reflexos":["DSR","férias","13º","aviso","FGTS"],
-"fgts":{"base":"todas as verbas","multa_40":true},"atualizacao_monetaria":"SELIC (ADC 58)",
-"juros":"SELIC|1% am","inss_empregado":"descontar","inss_patronal":"a cargo da reclamada",
-"ir":"tabela progressiva|isento","exclusoes_expressas":[],"observacoes":""}}""", limite=30000)
+{
+  "criterios": {
+    "base_salarial": "descrição da base (ex: última remuneração R$ X)",
+    "periodo_apurado": {"inicio": "dd/mm/aaaa", "fim": "dd/mm/aaaa"},
+    "jornada_contratual": "ex: 8h diárias / 44h semanais",
+    "jornada_real_apurada": "ex: 10h diárias conforme cartões de ponto",
+    "divisor": "220 ou 200 ou outro valor",
+    "adicional_horas_extras": "50% ou 100%",
+    "reflexos": ["DSR", "férias", "13º salário", "aviso prévio", "FGTS"],
+    "fgts": {"base": "todas as verbas deferidas", "multa_40": true},
+    "atualizacao_monetaria": "SELIC (ADC 58/59) ou outro índice",
+    "juros": "SELIC ou 1% ao mês",
+    "inss_empregado": "descontar na fonte conforme tabela progressiva",
+    "inss_patronal": "a cargo da reclamada",
+    "ir": "tabela progressiva ou isento",
+    "exclusoes_expressas": ["ex: dano moral não integra base FGTS"],
+    "observacoes": "outros critérios relevantes não listados acima"
+  }
+}
+""", limite=30000)
 
-def ext_ficha(txt):
-    return ia(txt,"""Extraia a ficha financeira. Liste TODAS as rubricas sem omitir nenhuma.
-{"rubricas":["SALÁRIO BASE","HE 50%","..."],
-"competencias":[{"competencia":"MM/AAAA",
-"valores":{"SALÁRIO BASE":{"referencia":"220h","valor":3000.00}},
-"total_proventos":0,"inss_base":0,"inss_desconto":0,"fgts_base":0}]}""", limite=40000)
 
-def ext_ponto(txt):
-    return ia(txt,"""Extraia o espelho de ponto com todos os registros.
-{"registros":[{"data":"dd/mm/aaaa","dia_semana":"SEG",
-"entradas_saidas":["08:00","12:00","13:00","18:00"],
-"horas_trabalhadas":"8:00","horas_extras":"0:00",
-"observacao":"DSR|Falta|Feriado|null"}]}""", limite=40000)
+# ══════════════════════════════════════════════════════════════════════════════
+# BLOCO 3 — GERAÇÃO DE ARQUIVOS
+# ══════════════════════════════════════════════════════════════════════════════
 
-# ── Geração Word ──────────────────────────────────────────────────────────────
-
-def gerar_word(bas, partes, decisoes, criterios) -> bytes:
+def gerar_word(dados, decisoes, criterios) -> bytes:
     doc = Document()
     doc.styles["Normal"].font.name = "Arial"
     doc.styles["Normal"].font.size = Pt(11)
@@ -166,78 +503,94 @@ def gerar_word(bas, partes, decisoes, criterios) -> bytes:
         x.alignment = WD_ALIGN_PARAGRAPH.LEFT
 
     def campo(label, val):
+        if not val: return
         p = doc.add_paragraph()
         p.add_run(f"{label}: ").bold = True
-        p.add_run(str(val or "Não informado"))
+        p.add_run(str(val))
 
     h("SÍNTESE DE DECISÕES PARA LIQUIDAÇÃO")
+
     h("1. Identificação do Processo", 2)
-    campo("Número", bas.get("numero_processo"))
+    campo("Número",    dados.get("numero_processo"))
+    campo("Vara",      dados.get("vara_trabalho"))
+    campo("Reclamante",dados.get("reclamante"))
+    campo("CPF",       dados.get("cpf_reclamante"))
+    campo("Reclamada", dados.get("reclamada_1"))
+    campo("CNPJ",      dados.get("cnpj_reclamada_1"))
+    campo("Advogado (reclamante)", dados.get("adv_reclamante"))
+    campo("Advogado (reclamada)",  dados.get("adv_reclamada_1"))
+    campo("Admissão",    dados.get("data_admissao"))
+    campo("Demissão",    dados.get("data_demissao"))
+    campo("Ajuizamento", dados.get("data_ajuizamento"))
+    if dados.get("oabs"):
+        campo("OABs encontradas", " | ".join(dados["oabs"]))
 
-    p = partes if (partes and "erro" not in partes) else {}
-    for lb, ch in [("Vara","vara_trabalho"),("Reclamante","reclamante"),
-                   ("CPF","cpf_reclamante"),("Advogado reclamante","adv_reclamante"),
-                   ("OAB reclamante","oab_reclamante"),("Reclamada","reclamada_1"),
-                   ("CNPJ","cnpj_reclamada_1"),("Advogado reclamada","adv_reclamada_1"),
-                   ("Admissão","data_admissao"),("Demissão","data_demissao"),
-                   ("Ajuizamento","data_ajuizamento"),("Função","funcao")]:
-        if p.get(ch): campo(lb, p[ch])
-    if p.get("reclamada_2"): campo("2ª Reclamada", p["reclamada_2"])
-
-    if decisoes and "erro" not in decisoes and decisoes.get("decisoes"):
+    if decisoes:
         h("2. Decisões Judiciais", 2)
-        for i, d in enumerate(decisoes["decisoes"], 1):
+        for i, d in enumerate(decisoes, 1):
             h(f"2.{i} {d.get('tipo','Decisão')}", 3)
-            campo("Data", d.get("data"))
+            campo("Data",      d.get("data"))
             campo("Resultado", d.get("resultado_reclamante"))
             if d.get("verbas_deferidas"):
-                campo("Verbas", ", ".join(d["verbas_deferidas"]))
+                campo("Verbas identificadas", ", ".join(d["verbas_deferidas"]))
             doc.add_paragraph().add_run("DISPOSITIVO:").bold = True
             doc.add_paragraph(d.get("dispositivo",""))
 
     if criterios and "erro" not in criterios and criterios.get("criterios"):
         h("3. Critérios de Liquidação", 2)
         c = criterios["criterios"]
-        periodo = c.get("periodo_apurado",{})
-        if periodo: campo("Período", f"{periodo.get('inicio')} a {periodo.get('fim')}")
-        for lb, ch in [("Base salarial","base_salarial"),
-                       ("Jornada contratual","jornada_contratual"),
-                       ("Jornada real","jornada_real_apurada"),("Divisor","divisor"),
-                       ("Adicional HE","adicional_horas_extras"),
-                       ("Atualização","atualizacao_monetaria"),("Juros","juros"),
-                       ("INSS empregado","inss_empregado"),("INSS patronal","inss_patronal"),
-                       ("IR","ir"),("Observações","observacoes")]:
-            if c.get(ch): campo(lb, c[ch])
-        if c.get("reflexos"): campo("Reflexos", ", ".join(c["reflexos"]))
+        per = c.get("periodo_apurado",{})
+        if per: campo("Período", f"{per.get('inicio')} a {per.get('fim')}")
+        for lb, ch in [
+            ("Base salarial","base_salarial"),
+            ("Jornada contratual","jornada_contratual"),
+            ("Jornada real apurada","jornada_real_apurada"),
+            ("Divisor","divisor"),
+            ("Adicional HE","adicional_horas_extras"),
+            ("Atualização monetária","atualizacao_monetaria"),
+            ("Juros","juros"),
+            ("INSS empregado","inss_empregado"),
+            ("INSS patronal","inss_patronal"),
+            ("IR","ir"),
+            ("Observações","observacoes"),
+        ]:
+            campo(lb, c.get(ch))
+        if c.get("reflexos"):
+            campo("Reflexos", ", ".join(c["reflexos"]))
         fgts = c.get("fgts",{})
-        if fgts: campo("FGTS", f"{fgts.get('base','')} — {'com' if fgts.get('multa_40') else 'sem'} multa 40%")
-        if c.get("exclusoes_expressas"): campo("Exclusões", "; ".join(c["exclusoes_expressas"]))
+        if fgts:
+            campo("FGTS", f"{fgts.get('base','')} — {'com' if fgts.get('multa_40') else 'sem'} multa 40%")
+        if c.get("exclusoes_expressas"):
+            campo("Exclusões expressas", "; ".join(c["exclusoes_expressas"]))
 
     buf = io.BytesIO(); doc.save(buf); buf.seek(0)
     return buf.getvalue()
 
-# ── Geração Markdown ──────────────────────────────────────────────────────────
 
-def gerar_markdown(bas, partes, decisoes, criterios) -> str:
+def gerar_markdown(dados, decisoes, criterios) -> str:
     md = ["# SÍNTESE DE DECISÕES PARA LIQUIDAÇÃO\n",
-          "## 1. Identificação do Processo\n",
-          f"**Número:** {bas.get('numero_processo','Não localizado')}"]
+          "## 1. Identificação do Processo\n"]
 
-    p = partes if (partes and "erro" not in partes) else {}
-    for lb, ch in [("Vara","vara_trabalho"),("Reclamante","reclamante"),
-                   ("CPF","cpf_reclamante"),("Advogado reclamante","adv_reclamante"),
-                   ("Reclamada","reclamada_1"),("CNPJ","cnpj_reclamada_1"),
-                   ("Admissão","data_admissao"),("Demissão","data_demissao"),
-                   ("Ajuizamento","data_ajuizamento"),("Função","funcao")]:
-        if p.get(ch): md.append(f"**{lb}:** {p[ch]}")
-    if p.get("reclamada_2"): md.append(f"**2ª Reclamada:** {p['reclamada_2']}")
+    for lb, ch in [
+        ("Número","numero_processo"),("Vara","vara_trabalho"),
+        ("Reclamante","reclamante"),("CPF","cpf_reclamante"),
+        ("Reclamada","reclamada_1"),("CNPJ","cnpj_reclamada_1"),
+        ("Advogado reclamante","adv_reclamante"),
+        ("Advogado reclamada","adv_reclamada_1"),
+        ("Admissão","data_admissao"),("Demissão","data_demissao"),
+        ("Ajuizamento","data_ajuizamento"),
+    ]:
+        if dados.get(ch): md.append(f"**{lb}:** {dados[ch]}")
+    if dados.get("oabs"):
+        md.append(f"**OABs:** {' | '.join(dados['oabs'])}")
 
-    if decisoes and "erro" not in decisoes and decisoes.get("decisoes"):
+    if decisoes:
         md.append("\n## 2. Decisões Judiciais\n")
-        for i, d in enumerate(decisoes["decisoes"], 1):
+        for i, d in enumerate(decisoes, 1):
             md.append(f"### 2.{i} {d.get('tipo','Decisão')}")
             md.append(f"**Data:** {d.get('data','')}  |  **Resultado:** {d.get('resultado_reclamante','')}")
-            if d.get("verbas_deferidas"): md.append(f"**Verbas:** {', '.join(d['verbas_deferidas'])}")
+            if d.get("verbas_deferidas"):
+                md.append(f"**Verbas:** {', '.join(d['verbas_deferidas'])}")
             md.append(f"\n**DISPOSITIVO:**\n\n{d.get('dispositivo','')}\n")
 
     if criterios and "erro" not in criterios and criterios.get("criterios"):
@@ -245,26 +598,28 @@ def gerar_markdown(bas, partes, decisoes, criterios) -> str:
         c = criterios["criterios"]
         per = c.get("periodo_apurado",{})
         if per: md.append(f"**Período:** {per.get('inicio')} a {per.get('fim')}")
-        for lb, ch in [("Base salarial","base_salarial"),("Jornada contratual","jornada_contratual"),
-                       ("Jornada real","jornada_real_apurada"),("Divisor","divisor"),
-                       ("Adicional HE","adicional_horas_extras"),("Atualização","atualizacao_monetaria"),
-                       ("Juros","juros"),("INSS empregado","inss_empregado"),
-                       ("INSS patronal","inss_patronal"),("IR","ir"),("Observações","observacoes")]:
+        for lb, ch in [
+            ("Base salarial","base_salarial"),("Jornada contratual","jornada_contratual"),
+            ("Jornada real","jornada_real_apurada"),("Divisor","divisor"),
+            ("Adicional HE","adicional_horas_extras"),("Atualização","atualizacao_monetaria"),
+            ("Juros","juros"),("INSS empregado","inss_empregado"),
+            ("INSS patronal","inss_patronal"),("IR","ir"),("Observações","observacoes"),
+        ]:
             if c.get(ch): md.append(f"**{lb}:** {c[ch]}")
         if c.get("reflexos"): md.append(f"**Reflexos:** {', '.join(c['reflexos'])}")
         fgts = c.get("fgts",{})
         if fgts: md.append(f"**FGTS:** {fgts.get('base','')} — {'com' if fgts.get('multa_40') else 'sem'} multa 40%")
-        if c.get("exclusoes_expressas"): md.append(f"**Exclusões:** {'; '.join(c['exclusoes_expressas'])}")
+        if c.get("exclusoes_expressas"):
+            md.append(f"**Exclusões:** {'; '.join(c['exclusoes_expressas'])}")
 
     return "\n\n".join(md)
 
-# ── Geração Excel ─────────────────────────────────────────────────────────────
 
 AZUL, BRANCO = "1F497D", "FFFFFF"
 
-def _cab(c, bg=AZUL):
+def _cab(c):
     c.font = Font(bold=True, color=BRANCO, size=11)
-    c.fill = PatternFill("solid", fgColor=bg)
+    c.fill = PatternFill("solid", fgColor=AZUL)
     c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
 def _borda(c):
@@ -272,88 +627,88 @@ def _borda(c):
     c.border = Border(left=b, right=b, top=b, bottom=b)
 
 def _campo_xl(ws, ln, label, val):
-    ca = ws.cell(ln, 1, label); cb = ws.cell(ln, 2, val or "")
+    ca = ws.cell(ln,1,label); cb = ws.cell(ln,2,val or "")
     ca.font = Font(bold=True); _borda(ca); _borda(cb)
-    return ln + 1
+    return ln+1
 
-def aba_liquidacao_xl(ws, bas, partes):
+def aba_liquidacao_xl(ws, dados):
     ws.column_dimensions["A"].width = 30
     ws.column_dimensions["B"].width = 50
     h = ws.cell(1,1,"LIQUIDAÇÃO DE SENTENÇA")
-    h.font = Font(bold=True, size=13, color=BRANCO)
-    h.fill = PatternFill("solid", fgColor=AZUL)
+    h.font = Font(bold=True,size=13,color=BRANCO)
+    h.fill = PatternFill("solid",fgColor=AZUL)
     h.alignment = Alignment(horizontal="center")
     ws.merge_cells("A1:B1")
-    p = partes if (partes and "erro" not in partes) else {}
     n = 3
-    for lb, ch in [("Número do processo","numero_processo"),("",""),
-                   ("Vara do Trabalho","vara_trabalho"),("",""),
-                   ("Reclamante","reclamante"),("CPF","cpf_reclamante"),
-                   ("Advogado reclamante","adv_reclamante"),("OAB","oab_reclamante"),("",""),
-                   ("1ª Reclamada","reclamada_1"),("CNPJ","cnpj_reclamada_1"),
-                   ("Advogado reclamada","adv_reclamada_1"),("",""),
-                   ("Admissão","data_admissao"),("Demissão","data_demissao"),
-                   ("Ajuizamento","data_ajuizamento"),("Função","funcao")]:
-        if lb == "":
-            n += 1; continue
-        src = bas if ch == "numero_processo" else p
-        n = _campo_xl(ws, n, lb, src.get(ch))
-    if p.get("reclamada_2"):
-        _campo_xl(ws, n, "2ª Reclamada", p["reclamada_2"])
+    for lb, ch in [
+        ("Número do processo","numero_processo"),("",""),
+        ("Vara do Trabalho","vara_trabalho"),("",""),
+        ("Reclamante","reclamante"),("CPF","cpf_reclamante"),
+        ("Advogado reclamante","adv_reclamante"),("",""),
+        ("1ª Reclamada","reclamada_1"),("CNPJ","cnpj_reclamada_1"),
+        ("Advogado reclamada","adv_reclamada_1"),("",""),
+        ("Admissão","data_admissao"),("Demissão","data_demissao"),
+        ("Ajuizamento","data_ajuizamento"),
+    ]:
+        if lb == "": n += 1; continue
+        n = _campo_xl(ws, n, lb, dados.get(ch))
 
 def aba_pagamentos_xl(ws, ficha):
     if not ficha or "erro" in ficha or not ficha.get("competencias"):
-        ws.cell(1,1,"Ficha financeira não encontrada no PDF."); return
+        ws.cell(1,1,"Ficha não localizada ou sem tabelas detectáveis."); return
     rubricas = ficha.get("rubricas",[])
     cabs = ["Competência"]
     for r in rubricas: cabs += [f"{r} Ref", f"{r} Valor"]
     cabs += ["Total Proventos","INSS Base","INSS Desconto","FGTS Base"]
-    for ci, t in enumerate(cabs, 1):
-        c = ws.cell(1, ci, t); _cab(c)
+    for ci,t in enumerate(cabs,1):
+        c = ws.cell(1,ci,t); _cab(c)
         ws.column_dimensions[get_column_letter(ci)].width = 16
-    for li, comp in enumerate(ficha["competencias"], 2):
-        col = 1; ws.cell(li, col, comp.get("competencia","")); col += 1
+    for li, comp in enumerate(ficha["competencias"],2):
+        col=1; ws.cell(li,col,comp.get("competencia","")); col+=1
         for r in rubricas:
             v = comp.get("valores",{}).get(r,{})
-            ws.cell(li, col, v.get("referencia","")); ws.cell(li, col+1, v.get("valor",0)); col += 2
-        ws.cell(li,col,comp.get("total_proventos",0)); ws.cell(li,col+1,comp.get("inss_base",0))
-        ws.cell(li,col+2,comp.get("inss_desconto",0)); ws.cell(li,col+3,comp.get("fgts_base",0))
+            ws.cell(li,col,v.get("referencia","")); ws.cell(li,col+1,v.get("valor",0)); col+=2
+        ws.cell(li,col,comp.get("total_proventos",""))
+        ws.cell(li,col+1,comp.get("inss_base",""))
+        ws.cell(li,col+2,comp.get("inss_desconto",""))
+        ws.cell(li,col+3,comp.get("fgts_base",""))
     ws.freeze_panes = "B2"
 
 def aba_ponto_xl(ws, ponto):
     if not ponto or "erro" in ponto or not ponto.get("registros"):
-        ws.cell(1,1,"Espelho de ponto não encontrado no PDF."); return
+        ws.cell(1,1,"Ponto não localizado ou sem tabelas detectáveis."); return
     regs = ponto["registros"]
     n_max = max((len(r.get("entradas_saidas",[])) for r in regs), default=4)
-    n_max = max(n_max, 2)
+    n_max = max(n_max,2)
     cabs = ["Data","Dia"]
-    for i in range(1, n_max//2+1): cabs += [f"E{i}", f"S{i}"]
+    for i in range(1,n_max//2+1): cabs += [f"E{i}",f"S{i}"]
     cabs += ["H.Trab.","H.Extra","Observação"]
-    for ci, t in enumerate(cabs, 1):
+    for ci,t in enumerate(cabs,1):
         c = ws.cell(1,ci,t); _cab(c)
         ws.column_dimensions[get_column_letter(ci)].width = 12
-    for li, reg in enumerate(regs, 2):
+    for li,reg in enumerate(regs,2):
         ws.cell(li,1,reg.get("data","")); ws.cell(li,2,reg.get("dia_semana",""))
-        for ci, hs in enumerate(reg.get("entradas_saidas",[]), 3):
-            ws.cell(li, ci, hs)
-        ultimo = 2 + n_max
+        for ci,hs in enumerate(reg.get("entradas_saidas",[]),3):
+            ws.cell(li,ci,hs)
+        ultimo = 2+n_max
         ws.cell(li,ultimo+1,reg.get("horas_trabalhadas",""))
         ws.cell(li,ultimo+2,reg.get("horas_extras",""))
         ws.cell(li,ultimo+3,reg.get("observacao",""))
     ws.freeze_panes = "A2"
 
-def gerar_excel(bas, partes, ficha, ponto, inc_pag, inc_pto) -> bytes:
+def gerar_excel(dados, ficha, ponto, inc_pag, inc_pto) -> bytes:
     wb = Workbook()
     ws = wb.active; ws.title = "LIQUIDACAO"
-    aba_liquidacao_xl(ws, bas, partes)
-    if inc_pag:
-        aba_pagamentos_xl(wb.create_sheet("PAGAMENTOS"), ficha)
-    if inc_pto:
-        aba_ponto_xl(wb.create_sheet("PONTO"), ponto)
+    aba_liquidacao_xl(ws, dados)
+    if inc_pag: aba_pagamentos_xl(wb.create_sheet("PAGAMENTOS"), ficha)
+    if inc_pto: aba_ponto_xl(wb.create_sheet("PONTO"), ponto)
     buf = io.BytesIO(); wb.save(buf); buf.seek(0)
     return buf.getvalue()
 
-# ── Interface ─────────────────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BLOCO 4 — INTERFACE
+# ══════════════════════════════════════════════════════════════════════════════
 
 arq = st.file_uploader("📄 PDF do processo", type=["pdf"])
 if not arq:
@@ -364,18 +719,18 @@ st.success(f"{arq.name} ({arq.size/1024/1024:.1f} MB)")
 st.subheader("O que extrair?")
 c1, c2 = st.columns(2)
 with c1:
-    f_partes    = st.checkbox("Dados do processo e partes",       value=True)
+    f_dados     = st.checkbox("Dados do processo e partes",        value=True)
     f_decisoes  = st.checkbox("Decisões judiciais (dispositivos)", value=True)
-    f_criterios = st.checkbox("Critérios de liquidação",           value=True)
+    f_criterios = st.checkbox("Critérios de liquidação ⚡IA",      value=True)
 with c2:
     f_ficha = st.checkbox("Ficha financeira (holerites)")
     f_ponto = st.checkbox("Espelho de ponto")
-st.caption("Cada item = ~1 chamada à IA (15–30 s). Ficha e ponto dependem do PDF conter esses documentos.")
+st.caption("⚡IA = chamada ao Groq. Todo o resto é processamento local, sem custo.")
 
 st.subheader("Arquivos de saída")
 c3, c4 = st.columns(2)
 with c3:
-    o_word = st.checkbox("Word (.docx)",     value=True)
+    o_word = st.checkbox("Word (.docx)",  value=True)
     o_md   = st.checkbox("Markdown (.md)")
 with c4:
     o_xl   = st.checkbox("Excel (.xlsx)")
@@ -383,9 +738,9 @@ with c4:
         st.caption("Abas Excel:")
         st.checkbox("LIQUIDACAO (sempre incluída)", value=True, disabled=True)
         aba_pag = st.checkbox("PAGAMENTOS (ficha)", disabled=not f_ficha,
-                              help="Marque 'Ficha financeira' acima para habilitar")
-        aba_pto = st.checkbox("PONTO (espelho)", disabled=not f_ponto,
-                              help="Marque 'Espelho de ponto' acima para habilitar")
+                              help="Marque 'Ficha financeira' acima")
+        aba_pto = st.checkbox("PONTO (espelho)",    disabled=not f_ponto,
+                              help="Marque 'Espelho de ponto' acima")
     else:
         aba_pag = aba_pto = False
 
@@ -398,93 +753,82 @@ if not st.button("⚙️ Processar", type="primary"):
 
 # ── Processamento ─────────────────────────────────────────────────────────────
 
-pdf  = arq.read()
-bas = partes = decisoes = criterios = ficha = ponto = {}
+pdf_bytes = arq.read()
+dados = decisoes_lista = criterios = ficha = ponto = None
 
 with st.spinner("Lendo PDF..."):
-    txt, npags = ler_pdf(pdf)
-    bas  = dados_basicos(txt)
+    doc_fitz, txt, npags = ler_pdf(pdf_bytes)
     secs = buscar_secoes(txt)
 
-st.write(f"✅ {npags} páginas — **{bas.get('numero_processo')}**")
+secoes_ok = list(secs.keys())
+st.write(f"✅ {npags} páginas lidas" +
+         (f" — seções: {', '.join(secoes_ok)}" if secoes_ok else " — nenhuma seção localizada por palavra-chave"))
 
-# Mostrar o que foi localizado por seção
-secoes_encontradas = [k for k in secs]
-if secoes_encontradas:
-    st.write(f"📑 Seções localizadas: {', '.join(secoes_encontradas)}")
-else:
-    st.warning("⚠️ Nenhuma seção localizada por palavra-chave. O texto completo será enviado à IA.")
-
-if f_partes:
-    t = txt[:15000]
-    with st.spinner("Partes (IA)..."): partes = ext_partes(t)
-    if "erro" in partes:
-        st.error(f"❌ Partes: {partes['erro']}")
-    else:
-        st.write(f"✅ {partes.get('reclamante','?')} × {partes.get('reclamada_1','?')}")
+if f_dados:
+    with st.spinner("Extraindo dados do processo (regex)..."):
+        dados = extrair_dados(txt)
+    num = dados.get("numero_processo","?")
+    rec = dados.get("reclamante","?")
+    emp = dados.get("reclamada_1","?")
+    st.write(f"✅ Processo {num} — {rec} × {emp}")
 
 if f_decisoes:
-    partes_decisao = []
-    if secs.get("sentenca"):  partes_decisao.append(secs["sentenca"])
-    if secs.get("acordao"):   partes_decisao.append(secs["acordao"])
-    if partes_decisao:
-        t = "\n\n---\n\n".join(partes_decisao)
-        st.caption(f"  → Seções localizadas ({len(t):,} chars)")
-    else:
-        t = txt[-40000:]
-        st.caption("  → Seção não localizada. Usando final do documento.")
-    with st.spinner("Decisões (IA)..."): decisoes = ext_decisoes(t)
-    if "erro" in decisoes:
-        st.error(f"❌ Decisões: {decisoes['erro']}")
-    else:
-        n = len(decisoes.get("decisoes",[]))
-        st.write(f"✅ {n} decisão(ões)" if n else "⚠️ Nenhuma decisão localizada")
+    trecho = "\n\n".join(filter(None, [secs.get("sentenca"), secs.get("acordao")]))
+    if not trecho:
+        trecho = txt[-50000:]  # fallback: final do processo
+        st.caption("  → Sentença não localizada por palavra-chave. Usando final do documento.")
+    with st.spinner("Extraindo decisões (texto literal)..."):
+        decisoes_lista = extrair_decisoes(trecho)
+    n = len(decisoes_lista)
+    st.write(f"✅ {n} decisão(ões) extraída(s)" if n else "⚠️ Nenhuma decisão localizada")
 
 if f_criterios:
-    partes_crit = []
-    if secs.get("dispositivo"): partes_crit.append(secs["dispositivo"])
-    if secs.get("sentenca"):    partes_crit.append(secs["sentenca"])
-    if partes_crit:
-        t = "\n\n---\n\n".join(partes_crit)
-    else:
-        t = txt[-30000:]
-    with st.spinner("Critérios (IA)..."): criterios = ext_criterios(t)
+    dispositivo = secs.get("dispositivo") or secs.get("sentenca") or txt[-30000:]
+    with st.spinner("Extraindo critérios de liquidação (⚡IA — 1 chamada)..."):
+        criterios = ext_criterios(dispositivo)
     if "erro" in criterios:
         st.error(f"❌ Critérios: {criterios['erro']}")
     else:
         st.write("✅ Critérios extraídos")
 
 if f_ficha:
-    t = secs.get("ficha","") or txt
-    with st.spinner("Ficha financeira (IA)..."): ficha = ext_ficha(t)
-    n = len(ficha.get("competencias",[]))
-    st.write(f"✅ Ficha: {n} competência(s)" if n else "⚠️ Ficha não localizada no PDF")
+    with st.spinner("Extraindo ficha financeira (tabelas PyMuPDF)..."):
+        ficha = extrair_ficha(doc_fitz)
+    if "erro" in ficha:
+        st.warning(f"⚠️ Ficha: {ficha['erro']}")
+    else:
+        n = len(ficha.get("competencias",[]))
+        st.write(f"✅ Ficha: {n} competência(s), {len(ficha.get('rubricas',[]))} rubrica(s)")
 
 if f_ponto:
-    t = secs.get("ponto","") or txt
-    with st.spinner("Espelho de ponto (IA)..."): ponto = ext_ponto(t)
-    n = len(ponto.get("registros",[]))
-    st.write(f"✅ Ponto: {n} registro(s)" if n else "⚠️ Ponto não localizado no PDF")
+    with st.spinner("Extraindo espelho de ponto (tabelas PyMuPDF)..."):
+        ponto = extrair_ponto(doc_fitz)
+    if "erro" in ponto:
+        st.warning(f"⚠️ Ponto: {ponto['erro']}")
+    else:
+        st.write(f"✅ Ponto: {len(ponto.get('registros',[]))} registro(s)")
+
+doc_fitz.close()
 
 # ── Downloads ─────────────────────────────────────────────────────────────────
 
 st.success("✅ Concluído!")
 st.subheader("📥 Downloads")
-num = bas.get("numero_processo","processo").replace("-","").replace(".","")
+num = (dados or {}).get("numero_processo","processo").replace("-","").replace(".","")
 
 if o_word:
     with st.spinner("Gerando Word..."):
-        wb = gerar_word(bas, partes, decisoes, criterios)
+        wb = gerar_word(dados or {}, decisoes_lista or [], criterios or {})
     st.download_button("📄 Word (.docx)", wb, f"sintese_{num}.docx",
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
 if o_md:
     with st.spinner("Gerando Markdown..."):
-        md = gerar_markdown(bas, partes, decisoes, criterios)
-    st.download_button("📝 Markdown (.md)", md.encode(), f"sintese_{num}.md", "text/markdown")
+        md = gerar_markdown(dados or {}, decisoes_lista or [], criterios or {})
+    st.download_button("📝 Markdown (.md)", md.encode(), f"sintese_{num}.md","text/markdown")
 
 if o_xl:
     with st.spinner("Gerando Excel..."):
-        xl = gerar_excel(bas, partes, ficha, ponto, aba_pag, aba_pto)
+        xl = gerar_excel(dados or {}, ficha or {}, ponto or {}, aba_pag, aba_pto)
     st.download_button("📊 Excel (.xlsx)", xl, f"liquidacao_{num}.xlsx",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
