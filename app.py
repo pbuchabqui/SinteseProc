@@ -99,7 +99,12 @@ def extrair_dados(txt: str, capa: str = "") -> dict:
     def normalizar_oab(s):
         m = re.search(r"OAB[/\s]*([A-Z]{2})[/\s#nº°.]*\s*([\d\.]+)", s, re.IGNORECASE)
         if m:
-            num = re.sub(r"\.", "", m.group(2))  # remove pontos do número
+            num = re.sub(r"\.", "", m.group(2))  # dígitos puros
+            # Reagrupar com ponto como separador de milhar (ex: 113880 → 113.880)
+            if len(num) > 3:
+                num = ".".join(
+                    [num[max(0, i-3):i] for i in range(len(num), 0, -3)][::-1]
+                )
             return f"OAB/{m.group(1).upper()} {num}"
         return s.strip()
     oabs_raw = todos(r"OAB[/\s]*[A-Z]{2}[/\s#nº°.]*\s*[\d\.]+")
@@ -173,9 +178,10 @@ def extrair_dados(txt: str, capa: str = "") -> dict:
 
 def buscar_secoes(doc: fitz.Document, toc: list, txt: str) -> dict:
     """
-    Localiza seções usando o sumário (TOC) do PDF quando disponível.
-    O TOC do PJe lista cada documento com tipo, data e página exata.
-    Fallback para busca textual se o TOC não tiver informação suficiente.
+    Quando o TOC está disponível (PDFs PJe), cada documento é identificado
+    individualmente com tipo, data e páginas exatas.
+    Retorna sec["documentos_decisao"] como lista ordenada de documentos,
+    além das chaves agrupadas por categoria para compatibilidade.
     """
     MAPA_TIPOS = {
         "Sentença":               "sentenca",
@@ -187,63 +193,101 @@ def buscar_secoes(doc: fitz.Document, toc: list, txt: str) -> dict:
         "Cartão de Ponto":        "ponto",
         "Espelho de Ponto":       "ponto",
     }
-    RELEVANTES = {"sentenca", "acordao", "embargos", "decisao", "ficha", "ponto"}
+    DECISOES_CATS = {"sentenca", "acordao", "embargos", "decisao"}
     npags = len(doc)
-    sec = {}
+    sec = {"documentos_decisao": []}
+
+    # Títulos a excluir — não são decisões, são notificações ou petições
+    EXCLUIR = re.compile(
+        r"^Intima[çc][aã]o|^Manifesta[çc][aã]o|^Contrarraz|^Recurso|"
+        r"^Agravo|^Certid[aã]o|^Comprovante|^Guia|^Planilha|"
+        r"^Impugna[çc][aã]o|^Petição|^Procura[çc][aã]o",
+        re.IGNORECASE
+    )
+    # Tipos de decisão relevantes para liquidação
+    DECISOES_RELEVANTES = {
+        "Sentença", "Acórdão", "Embargos de Declaração", "Decisão"
+    }
 
     if toc:
-        # ── Abordagem primária: navegar pelo TOC ──
-        entradas = []
-        for idx, entry in enumerate(toc):
-            _, titulo, pag_ini = entry
-            tipo_cat = next(
-                (cat for tipo_str, cat in MAPA_TIPOS.items()
-                 if tipo_str.lower() in titulo.lower()),
-                None
-            )
-            if not tipo_cat or tipo_cat not in RELEVANTES:
-                continue
-            # Página final = início da próxima entrada - 1
-            pag_fim = (toc[idx+1][2] - 1) if idx+1 < len(toc) else npags
-            entradas.append((tipo_cat, titulo, pag_ini-1, pag_fim-1))  # 0-based
-
-        # Para cada categoria, consolidar texto das páginas relevantes
-        # Decisões: agrupadas por categoria, em ordem cronológica
         from collections import defaultdict
         grupos = defaultdict(list)
-        for cat, titulo, p0, p1 in entradas:
+
+        for idx, entry in enumerate(toc):
+            _, titulo, pag_ini = entry
+            # Extrair o nome do tipo do título (após "N. DATA - TIPO - hash")
+            titulo_limpo = re.sub(r"^\d+\.\s+\d{2}/\d{2}/\d{4}\s+-\s+", "", titulo)
+            titulo_limpo = re.sub(r"\s+-\s+[a-f0-9]{7,8}$", "", titulo_limpo, flags=re.IGNORECASE)
+
+            # Excluir intimações, petições e outros documentos não-decisórios
+            if EXCLUIR.search(titulo_limpo):
+                continue
+
+            tipo_cat = next(
+                (cat for tipo_str, cat in MAPA_TIPOS.items()
+                 if tipo_str.lower() in titulo_limpo.lower()),
+                None
+            )
+            if not tipo_cat: continue
+
+            pag_fim = (toc[idx+1][2] - 1) if idx+1 < len(toc) else npags
+            p0, p1 = pag_ini - 1, pag_fim - 1  # 0-based
             texto_doc = "\n".join(doc[i].get_text() for i in range(p0, min(p1+1, npags)))
-            grupos[cat].append(f"\n--- {titulo} ---\n{texto_doc}")
+
+            # Data do título do TOC (confiável)
+            data_m = re.search(r"(\d{2}/\d{2}/\d{4})", titulo)
+            data = data_m.group(1) if data_m else None
+
+            if tipo_cat in DECISOES_CATS:
+                # Embargos: excluir petições da parte (sem assinatura de juiz)
+                if tipo_cat == "embargos":
+                    if not re.search(r"Juiz\b|Desembargador|Ministro", texto_doc, re.IGNORECASE):
+                        continue  # petição da parte, não decisão judicial
+
+                # Guardar documento individual — usado por extrair_decisoes
+                sec["documentos_decisao"].append({
+                    "tipo_cat": tipo_cat,
+                    "tipo_label": {
+                        "sentenca": "Sentença",
+                        "acordao":  "Acórdão",
+                        "embargos": "Embargos de Declaração",
+                        "decisao":  "Decisão",
+                    }.get(tipo_cat, tipo_cat.capitalize()),
+                    "titulo":   titulo,
+                    "data":     data,
+                    "texto":    texto_doc,
+                })
+                grupos[tipo_cat].append(f"\n--- {titulo} ---\n{texto_doc}")
+            elif tipo_cat in ("ficha", "ponto"):
+                grupos[tipo_cat].append(texto_doc)
 
         for cat, blocos in grupos.items():
             sec[cat] = "\n\n".join(blocos)
 
-    # ── Fallback textual para PDFs sem TOC ──
-    if not sec.get("sentenca") or not sec.get("dispositivo"):
+    # Fallback textual para PDFs sem TOC
+    if not sec["documentos_decisao"]:
         linhas = txt.split("\n")
-        padroes_fallback = {
-            "sentenca":    r"VISTOS[,\s]+RELATADOS|VISTOS[,\s]+ETC",
-            "acordao":     r"A\s*C\s*[OÓ]\s*R\s*D\s*[AÃ]\s*O",
-            "dispositivo": r"(?:^|\n)\s*Condeno\b|JULGO\s+PROCED|ISTO\s+POSTO",
+        padroes = {
+            "sentenca": r"VISTOS[,\s]+RELATADOS|VISTOS[,\s]+ETC",
+            "acordao":  r"A\s*C\s*[OÓ]\s*R\s*D\s*[AÃ]\s*O",
         }
-        for nome, p in padroes_fallback.items():
+        for nome, p in padroes.items():
             if nome in sec: continue
             for i in range(len(linhas)-1, -1, -1):
-                if re.search(p, linhas[i], re.IGNORECASE | re.MULTILINE):
+                if re.search(p, linhas[i], re.IGNORECASE):
                     sec[nome] = "\n".join(linhas[i:i+600])
                     break
 
-    # Ficha e ponto: busca textual (estrutura de tabela, não aparece no TOC tipo)
-    if not sec.get("ficha"):
-        linhas = txt.split("\n")
-        for i, l in enumerate(linhas):
-            if re.search(r"FICHA FINANCEIRA|CONTRACHEQUE|HOLERITE", l, re.IGNORECASE):
-                sec["ficha"] = "\n".join(linhas[i:i+600]); break
-    if not sec.get("ponto"):
-        linhas = txt.split("\n")
-        for i, l in enumerate(linhas):
-            if re.search(r"CART[AÃ]O DE PONTO|ESPELHO DE PONTO", l, re.IGNORECASE):
-                sec["ponto"] = "\n".join(linhas[i:i+600]); break
+    # Ficha e ponto via busca textual se não vieram do TOC
+    for nome, padrao in [
+        ("ficha", r"FICHA FINANCEIRA|CONTRACHEQUE|HOLERITE"),
+        ("ponto", r"CART[AÃ]O DE PONTO|ESPELHO DE PONTO"),
+    ]:
+        if not sec.get(nome):
+            linhas = txt.split("\n")
+            for i, l in enumerate(linhas):
+                if re.search(padrao, l, re.IGNORECASE):
+                    sec[nome] = "\n".join(linhas[i:i+600]); break
 
     return sec
 # ── 1.3 Extrair decisões (sem IA — extração literal de texto) ─────────────────
@@ -254,8 +298,11 @@ MARCADORES_TIPO = {
     "Embargos de Declaração":r"EMBARGOS\s+DE\s+DECLARA[CÇ][AÃ]O",
 }
 MARCADORES_DISPOSITIVO = [
-    r"ISTO\s+POSTO", r"DIANTE\s+DO\s+EXPOSTO", r"PELO\s+EXPOSTO",
+    r"ISSO\s+POSTO", r"ISTO\s+POSTO", r"ANTE\s+O\s+EXPOSTO",
+    r"DIANTE\s+DO\s+EXPOSTO", r"PELO\s+EXPOSTO",
     r"DECIDO\s*[:;]", r"DECIDE-SE", r"JULGO",
+    r"ACORDAM\s+os",       # acórdão TRT
+    r"^(III\s*\)\s*)?CONCLUSÃO",  # decisões TST/TRT monocráticas
 ]
 MARCADORES_FIM_DISPOSITIVO = [
     r"Intimem-se", r"Cumpra-se", r"Publique-se", r"Registre-se",
@@ -270,82 +317,131 @@ VERBAS_CONHECIDAS = [
     "horas in itinere", "sobreaviso", "prontidão",
 ]
 
-def extrair_decisoes(txt: str) -> list[dict]:
+def extrair_decisao_de_doc(doc_info: dict) -> dict:
     """
-    Extrai decisões por padrão de texto, sem IA.
-    - Tipo: regex no cabeçalho da seção
-    - Data: regex (dd/mm/aaaa)
-    - Dispositivo: extração literal entre marcador e fim
-    - Resultado: keyword search
-    - Verbas: lista pré-definida
+    Extrai dados de uma decisão a partir de um documento individual do TOC.
+    O tipo e a data já são conhecidos — só precisa localizar o dispositivo.
     """
+    tipo_label = doc_info["tipo_label"]
+    data       = doc_info["data"]  # data confiável do TOC
+    texto      = doc_info["texto"]
+    linhas     = texto.split("\n")
+    bloco      = texto
+
+    # Dispositivo — do marcador até o fim
+    dispositivo = ""
+    inicio_disp = None
+    for j, l in enumerate(linhas):
+        if any(re.search(p, l, re.IGNORECASE) for p in MARCADORES_DISPOSITIVO):
+            inicio_disp = j
+            break
+
+    if inicio_disp is not None:
+        linhas_disp = []
+        for l in linhas[inicio_disp:]:
+            linhas_disp.append(l)
+            if any(re.search(p, l, re.IGNORECASE) for p in MARCADORES_FIM_DISPOSITIVO):
+                break
+        dispositivo = "\n".join(linhas_disp).strip()
+    else:
+        # Fallback: texto completo do documento (despachos curtos, decisões monocráticas)
+        linhas_uteis = [l for l in linhas if l.strip() and not re.search(
+            r"^Fls\.|^Documento assinado|^https?://|^Número do (processo|documento)|^Certificado",
+            l.strip()
+        )]
+        dispositivo = "\n".join(linhas_uteis).strip()
+
+    # Resultado — keyword
+    resultado = "parcialmente procedente"
+    if re.search(r"JULGO\s+IMPROCEDENTE|NEGO\s+PROVIMENTO|improcedentes?", bloco, re.IGNORECASE):
+        resultado = "improcedente / negado provimento"
+    elif re.search(r"JULGO\s+PROCEDENTE[^S]|procedentes?\s+em\s+parte", bloco, re.IGNORECASE):
+        resultado = "parcialmente procedente"
+    elif re.search(r"DAR\s+PARCIAL\s+PROVIMENTO|parcial\s+provimento", bloco, re.IGNORECASE):
+        resultado = "parcialmente provido"
+    elif re.search(r"DAR\s+PROVIMENTO|provido", bloco, re.IGNORECASE):
+        resultado = "provido"
+
+    # Verbas — lista pré-definida
+    verbas = [v for v in VERBAS_CONHECIDAS
+              if re.search(re.escape(v), bloco, re.IGNORECASE)]
+
+    return {
+        "tipo":                 tipo_label,
+        "data":                 data,
+        "dispositivo":          dispositivo or "(dispositivo não localizado)",
+        "resultado_reclamante": resultado,
+        "verbas_deferidas":     verbas,
+    }
+
+
+def extrair_decisoes(secs: dict) -> list[dict]:
+    """
+    Extrai todas as decisões do processo.
+    Quando o TOC está disponível (secs["documentos_decisao"]),
+    processa cada documento individualmente — tipo e data já são conhecidos.
+    Fallback: busca textual no texto concatenado.
+    """
+    documentos = secs.get("documentos_decisao", [])
+
+    if documentos:
+        # TOC disponível — processar cada documento individualmente
+        return [extrair_decisao_de_doc(d) for d in documentos]
+
+    # Fallback: texto concatenado (PDFs sem TOC)
+    txt = "\n\n".join(filter(None, [
+        secs.get("sentenca"), secs.get("acordao"),
+        secs.get("embargos"), secs.get("decisao"),
+    ]))
+    if not txt:
+        return []
+
     decisoes = []
     linhas = txt.split("\n")
-
     i = 0
     while i < len(linhas):
         linha = linhas[i]
-
-        # Detectar início de uma decisão
         tipo_encontrado = None
         for tipo, padrao in MARCADORES_TIPO.items():
             if re.search(padrao, linha, re.IGNORECASE):
                 tipo_encontrado = tipo
                 break
-
         if not tipo_encontrado:
-            i += 1
-            continue
+            i += 1; continue
 
-        # Janela de até 600 linhas a partir do marcador
         janela = linhas[i:i+600]
         bloco  = "\n".join(janela)
-
-        # Data — primeira dd/mm/aaaa na janela
         m_data = re.search(r"\d{2}/\d{2}/\d{4}", bloco)
-        data = m_data.group() if m_data else None
+        data   = m_data.group() if m_data else None
 
-        # Dispositivo — do marcador até o fim
-        dispositivo = ""
         inicio_disp = None
         for j, l in enumerate(janela):
             if any(re.search(p, l, re.IGNORECASE) for p in MARCADORES_DISPOSITIVO):
-                inicio_disp = j
-                break
+                inicio_disp = j; break
 
+        dispositivo = ""
         if inicio_disp is not None:
             linhas_disp = []
             for l in janela[inicio_disp:]:
-                if any(re.search(p, l, re.IGNORECASE) for p in MARCADORES_FIM_DISPOSITIVO):
-                    linhas_disp.append(l)
-                    break
                 linhas_disp.append(l)
+                if any(re.search(p, l, re.IGNORECASE) for p in MARCADORES_FIM_DISPOSITIVO):
+                    break
             dispositivo = "\n".join(linhas_disp).strip()
 
-        # Resultado — keyword
-        resultado = "parcialmente procedente"  # default TRT
-        if re.search(r"JULGO\s+IMPROCEDENTE|pedidos?\s+improcedentes?", bloco, re.IGNORECASE):
-            resultado = "improcedente"
-        elif re.search(r"JULGO\s+PROCEDENTE[^S]|pedidos?\s+procedentes?[^S]", bloco, re.IGNORECASE):
-            resultado = "procedente"
-        elif re.search(r"parcialmente|em\s+parte", bloco, re.IGNORECASE):
-            resultado = "parcialmente procedente"
+        resultado = "parcialmente procedente"
+        if re.search(r"JULGO\s+IMPROCEDENTE|NEGO\s+PROVIMENTO", bloco, re.IGNORECASE):
+            resultado = "improcedente / negado provimento"
+        elif re.search(r"DAR\s+PARCIAL\s+PROVIMENTO", bloco, re.IGNORECASE):
+            resultado = "parcialmente provido"
 
-        # Verbas — lista pré-definida
-        verbas = [v for v in VERBAS_CONHECIDAS
-                  if re.search(re.escape(v), bloco, re.IGNORECASE)]
+        verbas = [v for v in VERBAS_CONHECIDAS if re.search(re.escape(v), bloco, re.IGNORECASE)]
 
-        if dispositivo or tipo_encontrado:
-            decisoes.append({
-                "tipo":                   tipo_encontrado,
-                "data":                   data,
-                "dispositivo":            dispositivo or "(dispositivo não localizado)",
-                "resultado_reclamante":   resultado,
-                "verbas_deferidas":       verbas,
-            })
-            i += 400  # pular para depois desta decisão
-        else:
-            i += 1
+        decisoes.append({
+            "tipo": tipo_encontrado, "data": data,
+            "dispositivo": dispositivo or "(dispositivo não localizado)",
+            "resultado_reclamante": resultado, "verbas_deferidas": verbas,
+        })
+        i += 400
 
     return decisoes
 
@@ -860,14 +956,14 @@ if f_dados:
     st.write(f"✅ Processo {num} — {rec} × {emp}")
 
 if f_decisoes:
-    trecho = "\n\n".join(filter(None, [secs.get("sentenca"), secs.get("acordao")]))
-    if not trecho:
-        trecho = txt[-50000:]  # fallback: final do processo
-        st.caption("  → Sentença não localizada por palavra-chave. Usando final do documento.")
     with st.spinner("Extraindo decisões (texto literal)..."):
-        decisoes_lista = extrair_decisoes(trecho)
+        decisoes_lista = extrair_decisoes(secs)
     n = len(decisoes_lista)
-    st.write(f"✅ {n} decisão(ões) extraída(s)" if n else "⚠️ Nenhuma decisão localizada")
+    if n:
+        tipos = ", ".join(d["tipo"] for d in decisoes_lista)
+        st.write(f"✅ {n} decisão(ões): {tipos}")
+    else:
+        st.write("⚠️ Nenhuma decisão localizada")
 
 if f_criterios:
     dispositivo = secs.get("dispositivo") or secs.get("sentenca") or txt[-30000:]
