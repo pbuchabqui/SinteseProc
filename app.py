@@ -56,61 +56,90 @@ def extrair_dados(txt: str) -> dict:
     def todos(padrao, texto=txt):
         return re.findall(padrao, texto, re.IGNORECASE)
 
-    # Número do processo (padrão CNJ obrigatório)
+    # ── Número do processo ──
     numero = primeiro(r"\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}")
 
-    # Vara do trabalho
-    vara = primeiro(
-        r"(\d+[ªº°]?\s*VARA\s+DO\s+TRABALHO[^\n]*)",
-        grupo=1
-    ) or primeiro(r"(VARA\s+DO\s+TRABALHO[^\n]*)", grupo=1)
+    # ── Vara do trabalho ──
+    vara = primeiro(r"(\d+[ªº°]?\s*VARA\s+DO\s+TRABALHO[^\n]{0,60})", grupo=1) \
+        or primeiro(r"(VARA\s+DO\s+TRABALHO[^\n]{0,60})", grupo=1)
+    if vara: vara = vara.strip().rstrip(".,;:()")
 
-    # CPF (reclamante — primeiro encontrado)
-    cpf = primeiro(r"\d{3}[\.\-]?\d{3}[\.\-]?\d{3}[\-]?\d{2}")
+    # ── CPF — formatar 000.000.000-00 ──
+    cpf_raw = primeiro(r"(\d{3}[\.\-]?\d{3}[\.\-]?\d{3}[\-]?\d{2})")
+    def formatar_cpf(raw):
+        if not raw: return None
+        d = re.sub(r"\D","",raw)
+        return f"{d[:3]}.{d[3:6]}.{d[6:9]}-{d[9:]}" if len(d)==11 else raw
+    cpf = formatar_cpf(cpf_raw)
 
-    # CNPJ (reclamada — primeiro encontrado)
-    cnpj = primeiro(r"\d{2}[\.\-]?\d{3}[\.\-]?\d{3}[\/]?\d{4}[\-]?\d{2}")
+    # ── CNPJ — formatar 00.000.000/0000-00 ──
+    cnpj_raw = primeiro(r"(\d{2}[\.\-]?\d{3}[\.\-]?\d{3}[\/]?\d{4}[\-]?\d{2})")
+    def formatar_cnpj(raw):
+        if not raw: return None
+        d = re.sub(r"\D","",raw)
+        return f"{d[:2]}.{d[2:5]}.{d[5:8]}/{d[8:12]}-{d[12:]}" if len(d)==14 else raw
+    cnpj = formatar_cnpj(cnpj_raw)
 
-    # OABs (pode haver vários)
-    oabs = todos(r"OAB[/\s]*[A-Z]{2}[/\s#nº°.]*\s*[\d\.]+")
+    # ── OABs — deduplicar mantendo ordem ──
+    oabs_raw = todos(r"OAB[/\s]*[A-Z]{2}[/\s#nº°.]*\s*[\d\.]+")
+    oabs = list(dict.fromkeys(o.strip() for o in oabs_raw))
 
-    # Datas — busca por labels próximos
+    # ── Datas — janela restrita de 120 chars após o label ──
     def data_apos_label(labels):
         for label in labels:
             m = re.search(
-                rf"{label}[^\d]*(\d{{2}}/\d{{2}}/\d{{4}})",
+                rf"{label}[^:.\n]{{0,30}}:\s*(\d{{2}}/\d{{2}}/\d{{4}})"
+                rf"|{label}[^\d\n]{{0,60}}(\d{{2}}/\d{{2}}/\d{{4}})",
                 txt, re.IGNORECASE
             )
-            if m: return m.group(1)
+            if m: return m.group(1) or m.group(2)
         return None
 
-    data_admissao   = data_apos_label(["admiss[aã]o", "admitido", "contratad"])
-    data_demissao   = data_apos_label(["demiss[aã]o", "despedid", "rescis[aã]o", "desligad"])
+    data_admissao    = data_apos_label(["admiss[aã]o", "admitid[ao]", "contratad[ao]"])
+    data_demissao    = data_apos_label(["demiss[aã]o", "despedid[ao]", "desligad[ao]",
+                                        "dispens[ao]", "término do contrato"])
     data_ajuizamento = data_apos_label(["ajuizamento", "distribui[çc][aã]o", "protocolo"])
 
-    # Nomes das partes — após labels padrão TRT
-    def nome_apos_label(labels):
+    # ── Reclamante — linha após o label ──
+    def nome_apos_label_estrito(labels, max_chars=60):
         for label in labels:
+            # Busca em linha própria ou após ":" — nome não pode conter verbos/preposições
             m = re.search(
-                rf"(?:^|\n){label}[:\s]+([A-ZÁÉÍÓÚÂÊÎÔÛÃÕÀÈÌÒÙÇ][^\n]{{3,80}})",
+                rf"(?:^|\n)\s*{label}\s*:?\s*([A-ZÁÉÍÓÚÂÊÎÔÛÃÕ][A-ZÁÉÍÓÚÂÊÎÔÛÃÕa-záéíóúâêîôûãõ\s]{{4,{max_chars}}})",
                 txt, re.IGNORECASE | re.MULTILINE
             )
             if m:
-                nome = m.group(1).strip().rstrip(".,;")
-                # Filtra linhas que são claramente não-nomes
-                if not re.search(r"CPF|CNPJ|OAB|Rua|Av\.|processo", nome, re.IGNORECASE):
-                    return nome
+                nome = m.group(1).strip().rstrip(".,;:()")
+                # Rejeitar se parece texto narrativo (contém verbos comuns)
+                if re.search(r"\b(não|pelo|pela|para|com|que|foi|era|está|tinha)\b",
+                             nome, re.IGNORECASE):
+                    continue
+                # Rejeitar se contém CPF/CNPJ/OAB inline
+                if re.search(r"CPF|CNPJ|OAB|\d{3}\.\d{3}", nome, re.IGNORECASE):
+                    continue
+                return nome
         return None
 
-    reclamante = nome_apos_label([
-        "RECLAMANTE", "AUTOR", "EXEQUENTE", "REQUERENTE"
-    ])
-    reclamada = nome_apos_label([
-        "RECLAMADA", "R[EÉ]U", "EXECUTADA", "REQUERIDA", "EMPRESA"
-    ])
+    reclamante = nome_apos_label_estrito(["RECLAMANTE","AUTOR[AE]?","EXEQUENTE","REQUERENTE"])
 
-    # Advogados — nome após "Dr." / "Dra." próximo a OAB
-    advs = todos(r"Dr[a]?\.\s+([A-ZÁÉÍÓÚÂÊÎÔÛÃÕ][a-záéíóúâêîôûãõ\s]{5,50})")
+    # ── Reclamada — buscar nome na linha imediatamente antes ou depois do CNPJ ──
+    reclamada = None
+    if cnpj_raw:
+        digitos_cnpj = re.sub(r"\D","",cnpj_raw)
+        # Procura no texto ao redor do CNPJ
+        m = re.search(
+            r"([A-ZÁÉÍÓÚÂÊÎÔÛÃÕ][A-ZÁÉÍÓÚa-záéíóúâêîôûãõ\s\-&\.]{4,60})"
+            r"[^\n]{0,30}" + re.escape(digitos_cnpj[:8]),
+            txt
+        )
+        if m:
+            reclamada = m.group(1).strip().rstrip(".,;:()")
+    # Fallback: label estrito
+    if not reclamada:
+        reclamada = nome_apos_label_estrito(["RECLAMADA","EXECUTADA","REQUERIDA"])
+
+    # ── Advogados — nome após Dr./Dra. e próximo a OAB ──
+    advs = todos(r"Dr[a]?\.\s+([A-ZÁÉÍÓÚÂÊÎÔÛÃÕ][a-záéíóúâêîôûãõ\s]{5,50}?)(?=\s*[-,\n]|OAB|$)")
 
     return {
         "numero_processo":  numero or "Não localizado",
@@ -138,7 +167,7 @@ def buscar_secoes(txt: str) -> dict:
     padroes_fim = {
         "sentenca":    r"S\s*E\s*N\s*T\s*E\s*N\s*[CÇ]\s*A|VISTOS[,\s]+RELATADOS|VISTOS E JULGADOS",
         "acordao":     r"A\s*C\s*[OÓ]\s*R\s*D\s*[AÃ]\s*O",
-        "dispositivo": r"^(ISTO POSTO|DIANTE DO EXPOSTO|PELO EXPOSTO|DECIDO|DECIDE-SE)",
+        "dispositivo": r"ISTO\s+POSTO|DIANTE\s+DO\s+EXPOSTO|PELO\s+EXPOSTO|DECIDO\b|DECIDE-SE",
     }
     padroes_inicio = {
         "ficha": r"FICHA FINANCEIRA|CONTRACHEQUE|HOLERITE|FOLHA DE PAGAMENTO",
