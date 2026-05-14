@@ -1,5 +1,6 @@
 """Deterministic PDF and text extraction helpers for SinteseProc."""
 
+import io
 import os
 import re
 import shutil
@@ -37,6 +38,11 @@ def extrair_textos_paginas(doc: fitz.Document) -> list[str]:
 def juntar_textos_paginas(textos_paginas: list[str]) -> str:
     paginas = [f"[PÁGINA {i+1}]\n{texto}" for i, texto in enumerate(textos_paginas)]
     return "\n".join(paginas)
+
+
+def gerar_texto_sanitizado(textos_paginas: list[str]) -> str:
+    """Gera texto auditável com marcadores de página para download técnico."""
+    return juntar_textos_paginas(textos_paginas or [])
 
 
 def _confianca_por_status(status: str, total_chars: int, total_palavras: int, tem_visual: bool) -> str:
@@ -559,6 +565,8 @@ def montar_estrutura_pdf(analise_pdf: dict, textos_paginas: list[str] | None = N
             "pagina_pdf": info.get("pagina", idx + 1),
             "texto_extraivel": bool(texto.strip() or info.get("texto_extraivel")),
             "ocr_aplicado": bool(info.get("ocr_aplicado")),
+            "backend_texto": "ocr" if info.get("ocr_aplicado") else "pymupdf",
+            "backend_tabela": info.get("backend_tabela"),
             "confianca": info.get("confianca", ""),
             "possiveis_tipos": info.get("possiveis_tipos", []),
             "alertas": info.get("alertas", []),
@@ -574,6 +582,63 @@ def montar_estrutura_pdf(analise_pdf: dict, textos_paginas: list[str] | None = N
         "auditoria": analise_pdf.get("auditoria", {}),
         "alertas": analise_pdf.get("alertas", []),
     }
+
+
+def avaliar_bloqueio_processamento(estrutura_pdf: dict) -> dict:
+    """Define política de segurança para uso automático de IA/tabelas."""
+    confianca = (estrutura_pdf.get("classificacao_tecnica", {}) or {}).get("confianca_global", "")
+    if confianca == "CRÍTICO":
+        return {
+            "nivel": confianca,
+            "bloquear": True,
+            "mensagem": (
+                "A confiabilidade técnica do PDF é CRÍTICA. "
+                "Chamadas IA e extrações tabulares automáticas foram bloqueadas; "
+                "é necessária conferência humana do PDF sanitizado."
+            ),
+        }
+    if confianca == "BAIXO":
+        return {
+            "nivel": confianca,
+            "bloquear": False,
+            "mensagem": (
+                "A confiabilidade técnica do PDF é BAIXA. "
+                "Os resultados podem ser usados apenas com conferência humana e auditoria."
+            ),
+        }
+    return {"nivel": confianca or "não informada", "bloquear": False, "mensagem": ""}
+
+
+def _menor_confianca(valores: list[str]) -> str:
+    ordem = {"CRÍTICO": 0, "BAIXO": 1, "MÉDIO": 2, "ALTO": 3, "": 4, None: 4}
+    return min(valores or [""], key=lambda v: ordem.get(v, 4)) or ""
+
+
+def anotar_decisoes_com_auditoria(decisoes: list[dict], estrutura_pdf: dict) -> list[dict]:
+    """Marca decisões que vieram de páginas OCRizadas ou de baixa confiança."""
+    paginas = {p.get("pagina_pdf"): p for p in estrutura_pdf.get("paginas", [])}
+    anotadas = []
+    for decisao in decisoes or []:
+        d = dict(decisao)
+        inicio = d.get("pagina_inicial")
+        fim = d.get("pagina_final") or inicio
+        pagina_infos = [paginas.get(p) for p in range(inicio or 0, (fim or 0) + 1) if paginas.get(p)]
+        alertas = []
+        if any(p.get("ocr_aplicado") for p in pagina_infos):
+            alertas.append("decisão extraída de página OCRizada")
+        baixas = [p for p in pagina_infos if p.get("confianca") in {"BAIXO", "CRÍTICO"}]
+        if baixas:
+            alertas.append("decisão contém página de baixa confiança técnica")
+        for p in pagina_infos:
+            alertas.extend(p.get("alertas", []))
+        if pagina_infos:
+            d["auditoria_extracao"] = {
+                "ocr_aplicado": any(p.get("ocr_aplicado") for p in pagina_infos),
+                "confianca_minima": _menor_confianca([p.get("confianca") for p in pagina_infos]),
+                "alertas": sorted(set(alertas)),
+            }
+        anotadas.append(d)
+    return anotadas
 
 
 def gerar_relatorio_preprocessamento_pdf(estrutura_pdf: dict) -> str:
@@ -1126,24 +1191,238 @@ def extrair_decisoes(secs: dict) -> list[dict]:
     return decisoes
 
 
+def extrair_tabelas_pdfplumber(
+    pdf_bytes: bytes | None,
+    textos_paginas: list[str] | None = None,
+    padrao_paginas: str | None = None,
+) -> list[dict]:
+    """Extrai tabelas com pdfplumber quando disponível, preservando fallback externo."""
+    if not pdf_bytes:
+        return []
+    try:
+        import pdfplumber
+    except Exception:
+        return []
+
+    tabelas = []
+    textos_paginas = textos_paginas or []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for idx, pagina in enumerate(pdf.pages):
+            texto_ref = textos_paginas[idx] if idx < len(textos_paginas) else (pagina.extract_text() or "")
+            if padrao_paginas and not re.search(padrao_paginas, texto_ref, re.IGNORECASE):
+                continue
+            try:
+                tabelas_pag = pagina.extract_tables() or []
+            except Exception:
+                continue
+            for linhas in tabelas_pag:
+                linhas_norm = [
+                    [str(c).strip() if c is not None else "" for c in linha]
+                    for linha in (linhas or [])
+                ]
+                linhas_norm = [linha for linha in linhas_norm if any(linha)]
+                if len(linhas_norm) >= 2:
+                    tabelas.append({
+                        "pagina": idx + 1,
+                        "backend": "pdfplumber",
+                        "linhas": linhas_norm,
+                        "linhas_total": len(linhas_norm),
+                        "colunas_total": max((len(l) for l in linhas_norm), default=0),
+                    })
+    return tabelas
+
+
+def _parse_float_ptbr(val_str: str):
+    try:
+        return float(
+            val_str.replace(".", "").replace(",", ".").replace("R$", "").strip()
+        )
+    except (ValueError, AttributeError):
+        return None
+
+
+def _acrescentar_ficha_de_linhas(linhas: list[list[str]], rubricas_set: set, competencias: list, backend: str = ""):
+    if not linhas or len(linhas) < 2:
+        return
+
+    cabecalho = [str(c).strip() if c else "" for c in linhas[0]]
+    col_comp = next(
+        (i for i, c in enumerate(cabecalho)
+         if re.search(r"compet[êe]ncia|m[êe]s|per[íi]odo", c, re.IGNORECASE)),
+        0
+    )
+
+    for linha in linhas[1:]:
+        if not linha or not any(linha):
+            continue
+        comp_val = str(linha[col_comp]).strip() if col_comp < len(linha) and linha[col_comp] else ""
+        if not re.search(r"\d{2}/\d{4}|\d{4}", comp_val):
+            continue
+
+        valores = {}
+        for ci, cel in enumerate(linha):
+            if ci == col_comp:
+                continue
+            nome_col = cabecalho[ci] if ci < len(cabecalho) else f"col_{ci}"
+            if not nome_col:
+                continue
+            val_str = str(cel).strip() if cel else ""
+            val_num = _parse_float_ptbr(val_str)
+            if val_str:
+                rubricas_set.add(nome_col)
+                valores[nome_col] = {"referencia": "", "valor": val_num if val_num is not None else val_str}
+
+        if valores:
+            competencias.append({
+                "competencia": comp_val,
+                "valores": valores,
+                "total_proventos": None,
+                "inss_base": None,
+                "inss_desconto": None,
+                "fgts_base": None,
+                "backend": backend,
+            })
+
+
+def validar_ficha(ficha: dict) -> dict:
+    """Valida a extração de ficha financeira para não parecer definitiva sem auditoria."""
+    alertas = []
+    competencias = ficha.get("competencias") or []
+    rubricas = ficha.get("rubricas") or []
+    if "erro" in ficha:
+        alertas.append(ficha["erro"])
+    if not competencias:
+        alertas.append("Ficha sem competências válidas extraídas.")
+    if not rubricas:
+        alertas.append("Ficha sem rubricas identificadas.")
+    ambiguos = 0
+    for comp in competencias:
+        for valor in (comp.get("valores") or {}).values():
+            if isinstance(valor.get("valor"), str):
+                ambiguos += 1
+    if ambiguos:
+        alertas.append(f"{ambiguos} valor(es) preservado(s) como texto por ambiguidade numérica.")
+    return {
+        "ok": not alertas,
+        "alertas": alertas,
+        "total_competencias": len(competencias),
+        "total_rubricas": len(rubricas),
+        "backend": ficha.get("backend") or "",
+    }
+
+
+def _acrescentar_ponto_de_linhas(linhas: list[list[str]], registros: list, backend: str = ""):
+    if not linhas or len(linhas) < 2:
+        return
+    DIAS = {"SEG","TER","QUA","QUI","SEX","SÁB","SAB","DOM"}
+    cabecalho = [str(c).strip() if c else "" for c in linhas[0]]
+
+    for linha in linhas[1:]:
+        if not linha:
+            continue
+        celulas = [str(c).strip() if c else "" for c in linha]
+        data = next((c for c in celulas if re.match(r"\d{2}/\d{2}/\d{4}", c)), None)
+        if not data:
+            continue
+        dia = next((c for c in celulas if c.upper() in DIAS), "")
+        horarios = []
+        ht = ""
+        he = ""
+        for ci, cel in enumerate(celulas):
+            if not re.match(r"\d{1,2}:\d{2}(?::\d{2})?$", cel):
+                continue
+            header = cabecalho[ci] if ci < len(cabecalho) else ""
+            if re.search(r"\b(H\.?TRAB|HT|TRABALHAD[AO]S?|TOTAL)\b", header, re.IGNORECASE):
+                ht = cel
+            elif re.search(r"\b(H\.?EXTRA|HE|EXTRA)\b", header, re.IGNORECASE):
+                he = cel
+            else:
+                horarios.append(cel)
+        obs = next(
+            (c for c in celulas
+             if re.search(r"DSR|FALTA|FERIADO|FOLGA|AFASTAMENTO|F[ÉE]RIAS|ATESTADO", c, re.IGNORECASE)),
+            ""
+        )
+        registros.append({
+            "data": data,
+            "dia_semana": dia,
+            "entradas_saidas": horarios,
+            "horas_trabalhadas": ht,
+            "horas_extras": he,
+            "observacao": obs,
+            "backend": backend,
+        })
+
+
+def validar_ponto(ponto: dict) -> dict:
+    """Valida marcações de ponto preservando alertas periciais de conferência."""
+    alertas = []
+    registros = ponto.get("registros") or []
+    if "erro" in ponto:
+        alertas.append(ponto["erro"])
+    if not registros:
+        alertas.append("Ponto sem registros válidos extraídos.")
+
+    total_marcacoes = 0
+    dias_impares = []
+    dias_multiplas_sem_totalizador = []
+    for reg in registros:
+        batidas = reg.get("entradas_saidas") or []
+        total_marcacoes += len(batidas)
+        if len(batidas) % 2 == 1:
+            dias_impares.append(reg.get("data", "?"))
+        if len(batidas) > 4 and not (reg.get("horas_trabalhadas") or reg.get("horas_extras")):
+            dias_multiplas_sem_totalizador.append(reg.get("data", "?"))
+
+    if dias_impares:
+        alertas.append("Marcações ímpares em: " + ", ".join(dias_impares[:20]))
+    if dias_multiplas_sem_totalizador:
+        alertas.append(
+            "Dias com múltiplas marcações sem totalizador explícito: "
+            + ", ".join(dias_multiplas_sem_totalizador[:20])
+        )
+
+    return {
+        "ok": not alertas,
+        "alertas": alertas,
+        "total_registros": len(registros),
+        "total_marcacoes": total_marcacoes,
+        "backend": ponto.get("backend") or "",
+    }
+
+
 # ── 1.4 Ficha financeira (PyMuPDF tabelas — sem IA) ───────────────────────────
 
-def extrair_ficha(doc: fitz.Document, textos_paginas: list[str] | None = None) -> dict:
+def extrair_ficha(
+    doc: fitz.Document,
+    textos_paginas: list[str] | None = None,
+    pdf_bytes: bytes | None = None,
+) -> dict:
     """
     Extrai ficha financeira usando detecção de tabelas do PyMuPDF.
     Sem IA — dados tabulares são determinísticos.
     """
     rubricas_set = set()
     competencias = []
+    padrao_ficha = r"FICHA FINANCEIRA|CONTRACHEQUE|HOLERITE|FOLHA DE PAGAMENTO"
 
     textos_paginas = textos_paginas or []
+    for tabela in extrair_tabelas_pdfplumber(pdf_bytes, textos_paginas, padrao_ficha):
+        _acrescentar_ficha_de_linhas(tabela["linhas"], rubricas_set, competencias, backend=tabela["backend"])
+
+    if competencias:
+        ficha = {
+            "rubricas": sorted(rubricas_set),
+            "competencias": competencias,
+            "backend": "pdfplumber",
+        }
+        ficha["validacao"] = validar_ficha(ficha)
+        return ficha
+
     for idx, pagina in enumerate(doc):
         texto_pag = textos_paginas[idx] if idx < len(textos_paginas) else pagina.get_text()
         # Verificar se esta página tem ficha financeira
-        if not re.search(
-            r"FICHA FINANCEIRA|CONTRACHEQUE|HOLERITE|FOLHA DE PAGAMENTO",
-            texto_pag, re.IGNORECASE
-        ):
+        if not re.search(padrao_ficha, texto_pag, re.IGNORECASE):
             continue
 
         try:
@@ -1159,73 +1438,42 @@ def extrair_ficha(doc: fitz.Document, textos_paginas: list[str] | None = None) -
             if not linhas or len(linhas) < 2:
                 continue
 
-            cabecalho = [str(c).strip() if c else "" for c in linhas[0]]
-
-            # Detectar coluna de competência
-            col_comp = next(
-                (i for i, c in enumerate(cabecalho)
-                 if re.search(r"compet[êe]ncia|m[êe]s|per[íi]odo", c, re.IGNORECASE)),
-                0
-            )
-
-            for linha in linhas[1:]:
-                if not linha or not any(linha):
-                    continue
-                comp_val = str(linha[col_comp]).strip() if linha[col_comp] else ""
-                if not re.search(r"\d{2}/\d{4}|\d{4}", comp_val):
-                    continue
-
-                valores = {}
-                for ci, cel in enumerate(linha):
-                    if ci == col_comp: continue
-                    nome_col = cabecalho[ci] if ci < len(cabecalho) else f"col_{ci}"
-                    if not nome_col: continue
-                    val_str = str(cel).strip() if cel else ""
-                    # Tentar converter para float
-                    val_num = None
-                    try:
-                        val_num = float(
-                            val_str.replace(".", "").replace(",", ".").replace("R$","").strip()
-                        )
-                    except (ValueError, AttributeError):
-                        pass
-                    if val_str:
-                        rubricas_set.add(nome_col)
-                        valores[nome_col] = {"referencia": "", "valor": val_num or val_str}
-
-                if valores:
-                    competencias.append({
-                        "competencia": comp_val,
-                        "valores": valores,
-                        "total_proventos": None,
-                        "inss_base": None,
-                        "inss_desconto": None,
-                        "fgts_base": None,
-                    })
+            _acrescentar_ficha_de_linhas(linhas, rubricas_set, competencias, backend="pymupdf")
 
     if not competencias:
         return {"erro": "Ficha não localizada ou sem tabelas detectáveis no PDF"}
 
-    return {"rubricas": sorted(rubricas_set), "competencias": competencias}
+    ficha = {"rubricas": sorted(rubricas_set), "competencias": competencias, "backend": "pymupdf"}
+    ficha["validacao"] = validar_ficha(ficha)
+    return ficha
 
 
 # ── 1.5 Espelho de ponto (PyMuPDF tabelas — sem IA) ───────────────────────────
 
-def extrair_ponto(doc: fitz.Document, textos_paginas: list[str] | None = None) -> dict:
+def extrair_ponto(
+    doc: fitz.Document,
+    textos_paginas: list[str] | None = None,
+    pdf_bytes: bytes | None = None,
+) -> dict:
     """
     Extrai espelho de ponto usando detecção de tabelas do PyMuPDF.
     Sem IA — dados tabulares são determinísticos.
     """
     registros = []
-    DIAS = {"SEG","TER","QUA","QUI","SEX","SÁB","SAB","DOM"}
+    padrao_ponto = r"CART[AÃ]O DE PONTO|ESPELHO DE PONTO|REGISTRO DE PONTO"
 
     textos_paginas = textos_paginas or []
+    for tabela in extrair_tabelas_pdfplumber(pdf_bytes, textos_paginas, padrao_ponto):
+        _acrescentar_ponto_de_linhas(tabela["linhas"], registros, backend=tabela["backend"])
+
+    if registros:
+        ponto = {"registros": registros, "backend": "pdfplumber"}
+        ponto["validacao"] = validar_ponto(ponto)
+        return ponto
+
     for idx, pagina in enumerate(doc):
         texto_pag = textos_paginas[idx] if idx < len(textos_paginas) else pagina.get_text()
-        if not re.search(
-            r"CART[AÃ]O DE PONTO|ESPELHO DE PONTO|REGISTRO DE PONTO",
-            texto_pag, re.IGNORECASE
-        ):
+        if not re.search(padrao_ponto, texto_pag, re.IGNORECASE):
             continue
 
         registros_antes = len(registros)
@@ -1242,42 +1490,7 @@ def extrair_ponto(doc: fitz.Document, textos_paginas: list[str] | None = None) -
             if not linhas or len(linhas) < 2:
                 continue
 
-            for linha in linhas[1:]:
-                if not linha: continue
-                celulas = [str(c).strip() if c else "" for c in linha]
-
-                # Identificar célula de data
-                data = next(
-                    (c for c in celulas if re.match(r"\d{2}/\d{2}/\d{4}", c)),
-                    None
-                )
-                if not data: continue
-
-                # Dia da semana
-                dia = next((c for c in celulas if c.upper() in DIAS), "")
-
-                # Horários (HH:MM)
-                horarios = [c for c in celulas if re.match(r"\d{2}:\d{2}", c)]
-
-                # Horas trabalhadas e extras (último par de HH:MM costuma ser totais)
-                ht = horarios[-2] if len(horarios) >= 2 else ""
-                he = horarios[-1] if len(horarios) >= 1 else ""
-
-                # Observação
-                obs = next(
-                    (c for c in celulas
-                     if re.search(r"DSR|FALTA|FERIADO|FOLGA|AFASTAMENTO|FÉRIAS", c, re.IGNORECASE)),
-                    ""
-                )
-
-                registros.append({
-                    "data":             data,
-                    "dia_semana":       dia,
-                    "entradas_saidas":  horarios[:-2] if len(horarios) > 2 else horarios,
-                    "horas_trabalhadas":ht,
-                    "horas_extras":     he,
-                    "observacao":       obs,
-                })
+            _acrescentar_ponto_de_linhas(linhas, registros, backend="pymupdf")
 
         if len(registros) == registros_antes:
             registros.extend(_extrair_ponto_texto_livre(texto_pag))
@@ -1285,7 +1498,9 @@ def extrair_ponto(doc: fitz.Document, textos_paginas: list[str] | None = None) -
     if not registros:
         return {"erro": "Ponto não localizado ou sem tabelas detectáveis no PDF"}
 
-    return {"registros": registros}
+    ponto = {"registros": registros, "backend": "pymupdf"}
+    ponto["validacao"] = validar_ponto(ponto)
+    return ponto
 
 
 def _extrair_ponto_texto_livre(texto: str) -> list[dict]:

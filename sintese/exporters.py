@@ -1,6 +1,7 @@
 """Report exporters for SinteseProc."""
 
 import io
+import json
 import math
 
 from docx import Document
@@ -9,6 +10,11 @@ from docx.shared import Inches, Pt
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+
+
+def gerar_json_bytes(obj) -> bytes:
+    return json.dumps(obj, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+
 
 def gerar_word(dados, decisoes, criterios, alertas=None) -> bytes:
     doc = Document()
@@ -90,6 +96,11 @@ def gerar_word(dados, decisoes, criterios, alertas=None) -> bytes:
                 campo_tabela(meta, "Páginas", f"{d.get('pagina_inicial')} a {pagina_final}")
             campo_tabela(meta, "Título de origem", d.get("titulo_origem"))
             campo_tabela(meta, "Resultado", d.get("resultado_reclamante"))
+            auditoria = d.get("auditoria_extracao") or {}
+            if auditoria.get("alertas"):
+                campo_tabela(meta, "Auditoria da extração", "; ".join(auditoria["alertas"]))
+            elif auditoria.get("ocr_aplicado"):
+                campo_tabela(meta, "Auditoria da extração", "decisão extraída de página OCRizada")
             if d.get("verbas_deferidas"):
                 campo_tabela(meta, "Verbas identificadas", ", ".join(d["verbas_deferidas"]))
             texto_multilinha("Dispositivo", d.get("dispositivo",""))
@@ -194,6 +205,11 @@ def gerar_markdown(dados, decisoes, criterios, alertas=None) -> str:
                 md.append(f"**Páginas:** {d.get('pagina_inicial')} a {pagina_final}")
             if d.get("titulo_origem"):
                 md.append(f"**Título de origem:** {d['titulo_origem']}")
+            auditoria = d.get("auditoria_extracao") or {}
+            if auditoria.get("alertas"):
+                md.append(f"**Auditoria da extração:** {'; '.join(auditoria['alertas'])}")
+            elif auditoria.get("ocr_aplicado"):
+                md.append("**Auditoria da extração:** decisão extraída de página OCRizada")
             if d.get("verbas_deferidas"):
                 md.append(f"**Verbas:** {', '.join(d['verbas_deferidas'])}")
             md.append(f"\n**DISPOSITIVO:**\n\n{d.get('dispositivo','')}\n")

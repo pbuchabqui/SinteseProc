@@ -9,16 +9,22 @@ import os
 import streamlit as st
 
 from sintese.ai import ext_alertas_periciais, ext_criterios, montar_contexto_criterios, montar_contexto_longo
-from sintese.exporters import gerar_excel, gerar_markdown, gerar_word
+from sintese.exporters import gerar_excel, gerar_json_bytes, gerar_markdown, gerar_word
 from sintese.extraction import (
     aplicar_ocr_necessario,
     analisar_pdf_texto,
+    anotar_decisoes_com_auditoria,
+    avaliar_bloqueio_processamento,
     buscar_secoes,
     extrair_dados,
     extrair_decisoes,
     extrair_ficha,
     extrair_ponto,
+    gerar_relatorio_preprocessamento_pdf,
+    gerar_texto_sanitizado,
     montar_estrutura_pdf,
+    validar_ficha,
+    validar_ponto,
     ler_pdf,
 )
 
@@ -144,6 +150,13 @@ if analise_pdf["total_baixo_texto"] or analise_pdf["total_sem_texto"]:
 for alerta_pre in estrutura_pdf.get("alertas", []):
     st.warning(alerta_pre)
 
+seguranca_pdf = avaliar_bloqueio_processamento(estrutura_pdf)
+if seguranca_pdf["mensagem"]:
+    if seguranca_pdf["bloquear"]:
+        st.error(f"🚫 {seguranca_pdf['mensagem']}")
+    else:
+        st.warning(f"⚠️ {seguranca_pdf['mensagem']}")
+
 secs = buscar_secoes(doc_fitz, toc, txt, textos_paginas=textos_paginas)
 secoes_ok = list(secs.keys())
 st.write(
@@ -162,7 +175,7 @@ if f_dados:
 
 if f_decisoes:
     with st.spinner("Extraindo decisões (texto literal)..."):
-        decisoes_lista = extrair_decisoes(secs)
+        decisoes_lista = anotar_decisoes_com_auditoria(extrair_decisoes(secs), estrutura_pdf)
     n = len(decisoes_lista)
     if n:
         tipos = ", ".join(d["tipo"] for d in decisoes_lista)
@@ -171,58 +184,78 @@ if f_decisoes:
         st.write("⚠️ Nenhuma decisão localizada")
 
 if f_criterios:
-    decisoes_para_criterios = decisoes_lista
-    if decisoes_para_criterios is None:
-        decisoes_para_criterios = extrair_decisoes(secs)
-    contexto_criterios = montar_contexto_criterios(
-        decisoes_para_criterios or [],
-        secs,
-        txt,
-        estrutura_pdf=estrutura_pdf,
-    )
-    with st.spinner("Extraindo critérios de liquidação (⚡IA — 1 chamada)..."):
-        criterios = ext_criterios(contexto_criterios, get_secret, GROQ_KEY, st.warning)
-    if "erro" in criterios:
-        st.error(f"❌ Critérios: {criterios['erro']}")
+    if seguranca_pdf["bloquear"]:
+        st.error("❌ Critérios bloqueados: PDF com confiabilidade técnica crítica.")
     else:
-        st.write("✅ Critérios extraídos")
+        decisoes_para_criterios = decisoes_lista
+        if decisoes_para_criterios is None:
+            decisoes_para_criterios = anotar_decisoes_com_auditoria(extrair_decisoes(secs), estrutura_pdf)
+        contexto_criterios = montar_contexto_criterios(
+            decisoes_para_criterios or [],
+            secs,
+            txt,
+            estrutura_pdf=estrutura_pdf,
+        )
+        with st.spinner("Extraindo critérios de liquidação (⚡IA — 1 chamada)..."):
+            criterios = ext_criterios(contexto_criterios, get_secret, GROQ_KEY, st.warning)
+        if "erro" in criterios:
+            st.error(f"❌ Critérios: {criterios['erro']}")
+        else:
+            st.write("✅ Critérios extraídos")
 
 if f_alertas:
-    decisoes_para_alertas = decisoes_lista
-    if decisoes_para_alertas is None:
-        decisoes_para_alertas = extrair_decisoes(secs)
-    texto_alertas = montar_contexto_longo(
-        decisoes_para_alertas or [],
-        secs,
-        txt,
-        estrutura_pdf=estrutura_pdf,
-        objetivo="alertas",
-        limite=20000,
-    )
-    with st.spinner("Gerando alertas periciais (⚡IA — 1 chamada)..."):
-        alertas = ext_alertas_periciais(texto_alertas, get_secret, GROQ_KEY, st.warning)
-    if "erro" in alertas:
-        st.error(f"❌ Alertas: {alertas['erro']}")
+    if seguranca_pdf["bloquear"]:
+        st.error("❌ Alertas IA bloqueados: PDF com confiabilidade técnica crítica.")
     else:
-        n_alertas = len(alertas.get("alertas", {}).get("pontos_atencao", []))
-        st.write(f"✅ Alertas gerados ({n_alertas} ponto(s) de atenção)")
+        decisoes_para_alertas = decisoes_lista
+        if decisoes_para_alertas is None:
+            decisoes_para_alertas = anotar_decisoes_com_auditoria(extrair_decisoes(secs), estrutura_pdf)
+        texto_alertas = montar_contexto_longo(
+            decisoes_para_alertas or [],
+            secs,
+            txt,
+            estrutura_pdf=estrutura_pdf,
+            objetivo="alertas",
+            limite=20000,
+        )
+        with st.spinner("Gerando alertas periciais (⚡IA — 1 chamada)..."):
+            alertas = ext_alertas_periciais(texto_alertas, get_secret, GROQ_KEY, st.warning)
+        if "erro" in alertas:
+            st.error(f"❌ Alertas: {alertas['erro']}")
+        else:
+            n_alertas = len(alertas.get("alertas", {}).get("pontos_atencao", []))
+            st.write(f"✅ Alertas gerados ({n_alertas} ponto(s) de atenção)")
 
 if f_ficha:
-    with st.spinner("Extraindo ficha financeira (tabelas PyMuPDF)..."):
-        ficha = extrair_ficha(doc_fitz, textos_paginas=textos_paginas)
-    if "erro" in ficha:
-        st.warning(f"⚠️ Ficha: {ficha['erro']}")
+    if seguranca_pdf["bloquear"]:
+        ficha = {"erro": "Extração tabular bloqueada por confiabilidade técnica crítica."}
+        st.error(f"❌ Ficha: {ficha['erro']}")
     else:
-        n = len(ficha.get("competencias",[]))
-        st.write(f"✅ Ficha: {n} competência(s), {len(ficha.get('rubricas',[]))} rubrica(s)")
+        with st.spinner("Extraindo ficha financeira (tabelas locais)..."):
+            ficha = extrair_ficha(doc_fitz, textos_paginas=textos_paginas, pdf_bytes=pdf_bytes)
+        ficha["validacao"] = validar_ficha(ficha)
+        if "erro" in ficha:
+            st.warning(f"⚠️ Ficha: {ficha['erro']}")
+        else:
+            n = len(ficha.get("competencias",[]))
+            st.write(f"✅ Ficha: {n} competência(s), {len(ficha.get('rubricas',[]))} rubrica(s)")
+        for alerta_ficha in ficha.get("validacao", {}).get("alertas", []):
+            st.warning(f"⚠️ Validação ficha: {alerta_ficha}")
 
 if f_ponto:
-    with st.spinner("Extraindo espelho de ponto (tabelas PyMuPDF)..."):
-        ponto = extrair_ponto(doc_fitz, textos_paginas=textos_paginas)
-    if "erro" in ponto:
-        st.warning(f"⚠️ Ponto: {ponto['erro']}")
+    if seguranca_pdf["bloquear"]:
+        ponto = {"erro": "Extração tabular bloqueada por confiabilidade técnica crítica."}
+        st.error(f"❌ Ponto: {ponto['erro']}")
     else:
-        st.write(f"✅ Ponto: {len(ponto.get('registros',[]))} registro(s)")
+        with st.spinner("Extraindo espelho de ponto (tabelas locais)..."):
+            ponto = extrair_ponto(doc_fitz, textos_paginas=textos_paginas, pdf_bytes=pdf_bytes)
+        ponto["validacao"] = validar_ponto(ponto)
+        if "erro" in ponto:
+            st.warning(f"⚠️ Ponto: {ponto['erro']}")
+        else:
+            st.write(f"✅ Ponto: {len(ponto.get('registros',[]))} registro(s)")
+        for alerta_ponto in ponto.get("validacao", {}).get("alertas", []):
+            st.warning(f"⚠️ Validação ponto: {alerta_ponto}")
 
 doc_fitz.close()
 
@@ -248,3 +281,13 @@ if o_xl:
         xl = gerar_excel(dados or {}, ficha or {}, ponto or {}, aba_pag, aba_pto)
     st.download_button("📊 Excel (.xlsx)", xl, f"liquidacao_{num}.xlsx",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+st.subheader("🧾 Auditoria técnica")
+relatorio_pre = gerar_relatorio_preprocessamento_pdf(estrutura_pdf)
+texto_sanitizado = gerar_texto_sanitizado(textos_paginas)
+st.download_button("🧾 Estrutura PDF (.json)", gerar_json_bytes(estrutura_pdf),
+    f"estrutura_pdf_{num}.json", "application/json")
+st.download_button("🧾 Relatório pré-processamento (.md)", relatorio_pre.encode(),
+    f"relatorio_preprocessamento_pdf_{num}.md", "text/markdown")
+st.download_button("🧾 Texto sanitizado (.txt)", texto_sanitizado.encode(),
+    f"texto_extraido_sanitizado_{num}.txt", "text/plain")

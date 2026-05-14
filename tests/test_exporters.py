@@ -1,8 +1,9 @@
 import io
+import json
 
 from docx import Document
 
-from sintese.exporters import gerar_word
+from sintese.exporters import gerar_json_bytes, gerar_markdown, gerar_word
 
 
 def test_gerar_word_formata_decisoes_com_tabela_e_dispositivo_multilinha():
@@ -17,6 +18,11 @@ def test_gerar_word_formata_decisoes_com_tabela_e_dispositivo_multilinha():
             "resultado_reclamante": "parcialmente procedente",
             "verbas_deferidas": ["horas extras", "FGTS"],
             "dispositivo": "Ante o exposto, julgo procedente.\nCondeno ao pagamento de horas extras.\nIntimem-se.",
+            "auditoria_extracao": {
+                "ocr_aplicado": True,
+                "confianca_minima": "BAIXO",
+                "alertas": ["decisão extraída de página OCRizada"],
+            },
         }
     ]
 
@@ -43,5 +49,31 @@ def test_gerar_word_formata_decisoes_com_tabela_e_dispositivo_multilinha():
     assert "12 a 14" in tabelas
     assert "Título de origem" in tabelas
     assert "1. 10/04/2024 - Sentença - abc12345" in tabelas
+    assert "Auditoria da extração" in tabelas
+    assert "decisão extraída de página OCRizada" in tabelas
     assert "Verbas identificadas" in tabelas
     assert "horas extras, FGTS" in tabelas
+
+
+def test_gerar_markdown_inclui_auditoria_decisao():
+    md = gerar_markdown(
+        {},
+        [{
+            "tipo": "Sentença",
+            "data": "10/04/2024",
+            "resultado_reclamante": "procedente",
+            "dispositivo": "Julgo procedente.",
+            "auditoria_extracao": {"alertas": ["decisão contém página de baixa confiança técnica"]},
+        }],
+        {},
+        {},
+    )
+
+    assert "Auditoria da extração" in md
+    assert "decisão contém página de baixa confiança técnica" in md
+
+
+def test_gerar_json_bytes_serializa_utf8():
+    payload = gerar_json_bytes({"confiança": "BAIXO"})
+
+    assert json.loads(payload.decode("utf-8")) == {"confiança": "BAIXO"}
