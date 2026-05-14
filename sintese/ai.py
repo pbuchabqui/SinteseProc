@@ -4,6 +4,7 @@ import json
 import re
 import time
 from collections.abc import Callable
+from html import escape
 
 from groq import Groq
 
@@ -93,6 +94,11 @@ def _formatar_decisao_para_contexto(decisao: dict, indice: int) -> str:
         f"Data: {decisao.get('data') or 'não localizada'}",
         f"Resultado: {decisao.get('resultado_reclamante') or 'não classificado'}",
     ]
+    if decisao.get("id_documento"):
+        partes.append(f"ID do documento: {decisao['id_documento']}")
+    if decisao.get("pagina_inicial"):
+        pagina_final = decisao.get("pagina_final") or decisao.get("pagina_inicial")
+        partes.append(f"Páginas: {decisao.get('pagina_inicial')} a {pagina_final}")
     if verbas:
         partes.append("Verbas identificadas: " + ", ".join(verbas))
     partes.append("Dispositivo:\n" + (decisao.get("dispositivo") or "(dispositivo não localizado)"))
@@ -135,6 +141,9 @@ def _novo_bloco_contexto(
     paginas: str = "",
     confianca: str = "",
     motivo: str = "",
+    source_id: str = "",
+    titulo_origem: str = "",
+    ocr_aplicado: bool = False,
 ) -> dict:
     return {
         "tipo": tipo,
@@ -145,6 +154,9 @@ def _novo_bloco_contexto(
         "paginas": paginas or "não informada",
         "confianca": confianca or "não informada",
         "motivo": motivo or "relevância documental",
+        "source_id": source_id or "",
+        "titulo_origem": titulo_origem or "",
+        "ocr_aplicado": bool(ocr_aplicado),
     }
 
 
@@ -172,8 +184,14 @@ def _blocos_decisoes(decisoes: list[dict]) -> list[dict]:
             texto=texto,
             fonte="decisao_extraida",
             titulo=f"Decisão {indice}: {tipo_label}",
+            paginas=(
+                f"{decisao.get('pagina_inicial')} a {decisao.get('pagina_final') or decisao.get('pagina_inicial')}"
+                if decisao.get("pagina_inicial") else ""
+            ),
             confianca="ALTO",
             motivo="dispositivo e metadados extraídos deterministicamente",
+            source_id=decisao.get("id_documento") or "",
+            titulo_origem=decisao.get("titulo_origem") or "",
         ))
     return blocos
 
@@ -245,19 +263,28 @@ def _blocos_estrutura_pdf(estrutura_pdf: dict | None, texto_completo: str, objet
 
     for pagina in estrutura_pdf.get("paginas") or []:
         possiveis = set(pagina.get("possiveis_tipos") or [])
-        if not (possiveis & tipos_aceitos):
+        incluir_por_alerta = (
+            objetivo == "alertas"
+            and (
+                pagina.get("ocr_aplicado")
+                or pagina.get("confianca") in {"BAIXO", "CRÍTICO"}
+                or pagina.get("alertas")
+            )
+        )
+        if not (possiveis & tipos_aceitos) and not incluir_por_alerta:
             continue
         pagina_pdf = pagina.get("pagina_pdf")
         texto_pagina = _extrair_texto_pagina(texto_completo, pagina_pdf)
         if not texto_pagina and not pagina.get("alertas"):
             continue
-        tipo = sorted(possiveis & tipos_aceitos)[0]
+        tipo = sorted(possiveis & tipos_aceitos)[0] if possiveis & tipos_aceitos else "pagina_alerta"
         prioridade = {
             "decisao": 38,
             "calculos": 48,
             "ponto": 52,
             "holerite": 54,
             "sumario": 68,
+            "pagina_alerta": 46,
         }.get(tipo, 75)
         texto = texto_pagina or "Alertas da página: " + " | ".join(pagina.get("alertas") or [])
         blocos.append(_novo_bloco_contexto(
@@ -269,6 +296,8 @@ def _blocos_estrutura_pdf(estrutura_pdf: dict | None, texto_completo: str, objet
             paginas=str(pagina_pdf),
             confianca=pagina.get("confianca") or "",
             motivo="página candidata identificada no pré-processamento",
+            source_id=f"pagina-{pagina_pdf}",
+            ocr_aplicado=pagina.get("ocr_aplicado", False),
         ))
     return blocos
 
@@ -316,27 +345,110 @@ def _deduplicar_blocos(blocos: list[dict]) -> list[dict]:
 
 
 def _formatar_mapa_evidencias(blocos: list[dict]) -> str:
-    linhas = [
-        "## Mapa de Evidências",
-        "| ID | Tipo | Fonte | Páginas | Confiança | Motivo |",
-        "|---|---|---|---|---|---|",
-    ]
+    return formatar_evidence_index(blocos)
+
+
+def _xml_attr(valor) -> str:
+    return escape(str(valor or ""), quote=True)
+
+
+def _xml_text(valor) -> str:
+    return escape(str(valor or ""), quote=False)
+
+
+def formatar_evidence_index(blocos: list[dict]) -> str:
+    linhas = ["<evidence_index>"]
     for idx, bloco in enumerate(blocos, 1):
         linhas.append(
-            f"| EV-{idx:02d} | {bloco['tipo']} | {bloco['fonte']} | "
-            f"{bloco['paginas']} | {bloco['confianca']} | {bloco['motivo']} |"
+            "  "
+            f"<item id=\"EV-{idx:02d}\" "
+            f"type=\"{_xml_attr(bloco['tipo'])}\" "
+            f"source=\"{_xml_attr(bloco['fonte'])}\" "
+            f"source_id=\"{_xml_attr(bloco.get('source_id'))}\" "
+            f"pages=\"{_xml_attr(bloco['paginas'])}\" "
+            f"confidence=\"{_xml_attr(bloco['confianca'])}\" "
+            f"ocr=\"{'true' if bloco.get('ocr_aplicado') else 'false'}\" "
+            f"title=\"{_xml_attr(bloco['titulo'])}\" />"
         )
+    linhas.append("</evidence_index>")
     return "\n".join(linhas)
 
 
-def _formatar_bloco_evidencia(bloco: dict, idx: int, limite_texto: int) -> str:
+def formatar_evidence_xml(bloco: dict, idx: int, limite_texto: int = 4500) -> str:
     texto = _recortar_texto(bloco["texto"], limite_texto)
     return "\n".join([
-        f"### EV-{idx:02d} — {bloco['titulo']}",
-        f"Tipo: {bloco['tipo']} | Fonte: {bloco['fonte']} | Páginas: {bloco['paginas']} | Confiança: {bloco['confianca']}",
-        f"Motivo: {bloco['motivo']}",
-        "",
-        texto,
+        f"<evidence id=\"EV-{idx:02d}\" "
+        f"type=\"{_xml_attr(bloco['tipo'])}\" "
+        f"source=\"{_xml_attr(bloco['fonte'])}\" "
+        f"source_id=\"{_xml_attr(bloco.get('source_id'))}\" "
+        f"pages=\"{_xml_attr(bloco['paginas'])}\" "
+        f"confidence=\"{_xml_attr(bloco['confianca'])}\" "
+        f"ocr=\"{'true' if bloco.get('ocr_aplicado') else 'false'}\">",
+        f"  <title>{_xml_text(bloco['titulo'])}</title>",
+        f"  <origin_title>{_xml_text(bloco.get('titulo_origem'))}</origin_title>",
+        f"  <reason>{_xml_text(bloco['motivo'])}</reason>",
+        "  <content>",
+        _xml_text(texto),
+        "  </content>",
+        "</evidence>",
+    ])
+
+
+def _formatar_bloco_evidencia(bloco: dict, idx: int, limite_texto: int) -> str:
+    return formatar_evidence_xml(bloco, idx, limite_texto)
+
+
+def formatar_critical_recap(blocos: list[dict], objetivo: str) -> str:
+    tipos_criticos = {"sentenca", "acordao", "embargos", "decisao"}
+    criticos = [
+        (idx, bloco)
+        for idx, bloco in enumerate(blocos, 1)
+        if (
+            bloco["tipo"] in tipos_criticos
+            or bloco.get("ocr_aplicado")
+            or bloco.get("confianca") in {"BAIXO", "CRÍTICO"}
+        )
+    ]
+    if not criticos:
+        criticos = list(enumerate(blocos[:3], 1))
+
+    linhas = [
+        f"<critical_recap objective=\"{_xml_attr(objetivo)}\">",
+        "  <instruction>Releia estes pontos antes de responder; eles reduzem perda de informação no meio do contexto.</instruction>",
+    ]
+    for idx, bloco in criticos[:6]:
+        linhas.extend([
+            f"  <recap evidence_id=\"EV-{idx:02d}\" "
+            f"type=\"{_xml_attr(bloco['tipo'])}\" "
+            f"pages=\"{_xml_attr(bloco['paginas'])}\" "
+            f"confidence=\"{_xml_attr(bloco['confianca'])}\" "
+            f"source_id=\"{_xml_attr(bloco.get('source_id'))}\" "
+            f"ocr=\"{'true' if bloco.get('ocr_aplicado') else 'false'}\">",
+            f"    <title>{_xml_text(bloco['titulo'])}</title>",
+            f"    <snippet>{_xml_text(_recortar_texto(bloco['texto'], 650))}</snippet>",
+            "  </recap>",
+        ])
+    linhas.append("</critical_recap>")
+    return "\n".join(linhas)
+
+
+def montar_prompt_tarefa(instrucao: str, contexto: str) -> str:
+    contexto = (contexto or "").strip()
+    if "<document_context" not in contexto:
+        contexto = "\n".join([
+            "<document_context format=\"raw_fallback\">",
+            "  <evidence id=\"EV-RAW\" type=\"raw_text\" source=\"fallback\" confidence=\"não informada\">",
+            "    <content>",
+            _xml_text(contexto),
+            "    </content>",
+            "  </evidence>",
+            "</document_context>",
+        ])
+    return "\n\n".join([
+        contexto,
+        "<task_context>",
+        _xml_text((instrucao or "").strip()),
+        "</task_context>",
     ])
 
 
@@ -381,37 +493,32 @@ def montar_contexto_longo(
     selecionados, truncado = selecionar_blocos_contexto(blocos, orcamento_blocos)
 
     cabecalho = [
-        f"# Pacote de Contexto — {objetivo}",
-        "",
-        "Use apenas as evidências abaixo. Se uma informação não estiver nas evidências, marque como ausente ou pendente de conferência.",
-        "Cada evidência contém fonte, páginas e confiança técnica quando disponíveis.",
-        "",
+        f"<document_context objective=\"{_xml_attr(objetivo)}\" format=\"structured_evidence_v1\">",
+        "  <context_rules>",
+        "    Use apenas as evidências abaixo. Se uma informação não estiver nas evidências, marque como ausente ou pendente de conferência.",
+        "    Cada evidência contém fonte, páginas, OCR e confiança técnica quando disponíveis.",
+        "  </context_rules>",
         _formatar_mapa_evidencias(selecionados),
-        "",
-        "## Evidências Priorizadas",
+        "<evidences>",
     ]
     limite_por_bloco = max(1200, min(4500, orcamento_blocos // max(len(selecionados), 1)))
     corpo = [
         _formatar_bloco_evidencia(bloco, idx, limite_por_bloco)
         for idx, bloco in enumerate(selecionados, 1)
     ]
-    reforco = [
-        "## Reforço Final — Pontos Críticos",
-        "Releia especialmente as evidências de menor ID, pois foram priorizadas por força decisória/pericial.",
+    fechamento = [
+        "</evidences>",
+        formatar_critical_recap(selecionados, objetivo),
     ]
-    for idx, bloco in enumerate(selecionados[:4], 1):
-        reforco.append(
-            f"- EV-{idx:02d}: {bloco['tipo']} em {bloco['fonte']} "
-            f"(páginas {bloco['paginas']}, confiança {bloco['confianca']})."
-        )
     if truncado:
-        reforco.append("[CONTEXTO TRUNCADO: blocos menos relevantes foram omitidos para preservar o orçamento.]")
+        fechamento.append("<truncation_notice>CONTEXTO TRUNCADO: blocos menos relevantes foram omitidos para preservar o orçamento.</truncation_notice>")
+    fechamento.append("</document_context>")
 
-    contexto = "\n\n".join(cabecalho + corpo + ["\n".join(reforco)])
+    contexto = "\n\n".join(cabecalho + corpo + fechamento)
     if len(contexto) <= limite:
         return contexto
-    aviso = "[CONTEXTO TRUNCADO: evidências críticas preservadas no início e no reforço final.]\n\n"
-    return aviso + contexto[: max(limite - len(aviso), 0)]
+    aviso = "<truncation_notice>CONTEXTO TRUNCADO: evidências críticas preservadas no início e no critical_recap.</truncation_notice>\n"
+    return aviso + _recortar_texto(contexto, max(limite - len(aviso), 0))
 
 
 def montar_contexto_criterios(
@@ -487,6 +594,12 @@ def chamar_ia(
     usa_raciocinio = modelo == MODELO_RACIOCINIO
 
     base = CONHECIMENTO_TRABALHISTA if incluir_base_trabalhista else ""
+    contexto_orcado = _recortar_texto(txt, max(limite - len(instrucao) - 300, 1000))
+    prompt_usuario = montar_prompt_tarefa(instrucao, contexto_orcado)
+    if len(prompt_usuario) > limite:
+        contexto_orcado = _recortar_texto(txt, max(limite - len(instrucao) - 900, 1000))
+        prompt_usuario = montar_prompt_tarefa(instrucao, contexto_orcado)
+
     params = dict(
         model=modelo, stream=False,
         messages=[
@@ -495,7 +608,7 @@ def chamar_ia(
                 + REGRAS_ANALISE
                 + (f"\n\n## Base de referência jurídica\n{base}" if base else "")
                 + "\n\nResponda APENAS com JSON válido, sem texto antes/depois, sem ```json```.")},
-            {"role":"user","content":f"{instrucao}\n\nTEXTO:\n{_recortar_texto(txt, limite)}"},
+            {"role":"user","content": prompt_usuario},
         ]
     )
     if usa_raciocinio:

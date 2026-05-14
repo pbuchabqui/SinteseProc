@@ -843,6 +843,8 @@ def buscar_secoes(doc: fitz.Document, toc: list, txt: str, textos_paginas: list[
             # Data do título do TOC (confiável)
             data_m = re.search(r"(\d{2}/\d{2}/\d{4})", titulo)
             data = data_m.group(1) if data_m else None
+            id_m = re.search(r"\s+-\s+([a-f0-9]{7,40})$", titulo, re.IGNORECASE)
+            id_documento = id_m.group(1) if id_m else None
 
             if tipo_cat in DECISOES_CATS:
                 # Embargos: excluir petições da parte (sem assinatura de juiz)
@@ -860,6 +862,9 @@ def buscar_secoes(doc: fitz.Document, toc: list, txt: str, textos_paginas: list[
                         "decisao":  "Decisão",
                     }.get(tipo_cat, tipo_cat.capitalize()),
                     "titulo":   titulo,
+                    "id_documento": id_documento,
+                    "pagina_inicial": pag_ini,
+                    "pagina_final": pag_fim,
                     "data":     data,
                     "texto":    texto_doc,
                 })
@@ -1040,6 +1045,10 @@ def extrair_decisao_de_doc(doc_info: dict) -> dict:
     return {
         "tipo":                 tipo_label,
         "data":                 data,
+        "id_documento":         doc_info.get("id_documento"),
+        "titulo_origem":        doc_info.get("titulo"),
+        "pagina_inicial":       doc_info.get("pagina_inicial"),
+        "pagina_final":         doc_info.get("pagina_final"),
         "dispositivo":          dispositivo or "(dispositivo não localizado)",
         "resultado_reclamante": resultado,
         "verbas_deferidas":     verbas,

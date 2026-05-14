@@ -5,7 +5,7 @@ import math
 
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.shared import Pt
+from docx.shared import Inches, Pt
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
@@ -24,6 +24,39 @@ def gerar_word(dados, decisoes, criterios, alertas=None) -> bytes:
         p = doc.add_paragraph()
         p.add_run(f"{label}: ").bold = True
         p.add_run(str(val))
+
+    def campo_tabela(tabela, label, val):
+        if not val:
+            return
+        row = tabela.add_row()
+        row.cells[0].text = label
+        row.cells[1].text = str(val)
+        for cell in row.cells:
+            for paragraph in cell.paragraphs:
+                paragraph.paragraph_format.space_after = Pt(2)
+                for run in paragraph.runs:
+                    run.font.name = "Arial"
+                    run.font.size = Pt(10)
+        row.cells[0].paragraphs[0].runs[0].bold = True
+
+    def texto_multilinha(titulo, texto):
+        p = doc.add_paragraph()
+        p.paragraph_format.space_before = Pt(6)
+        p.paragraph_format.space_after = Pt(3)
+        p.add_run(titulo).bold = True
+
+        linhas = [l.strip() for l in str(texto or "").replace("\r\n", "\n").split("\n")]
+        linhas = [l for l in linhas if l]
+        if not linhas:
+            linhas = ["(não localizado)"]
+
+        for linha in linhas:
+            par = doc.add_paragraph()
+            par.paragraph_format.left_indent = Inches(0.25)
+            par.paragraph_format.first_line_indent = Inches(0)
+            par.paragraph_format.space_after = Pt(3)
+            par.paragraph_format.line_spacing = 1.05
+            par.add_run(linha)
 
     h("SÍNTESE DE DECISÕES PARA LIQUIDAÇÃO")
 
@@ -46,12 +79,20 @@ def gerar_word(dados, decisoes, criterios, alertas=None) -> bytes:
         h("2. Decisões Judiciais", 2)
         for i, d in enumerate(decisoes, 1):
             h(f"2.{i} {d.get('tipo','Decisão')}", 3)
-            campo("Data",      d.get("data"))
-            campo("Resultado", d.get("resultado_reclamante"))
+            meta = doc.add_table(rows=0, cols=2)
+            meta.style = "Table Grid"
+            meta.columns[0].width = Inches(1.7)
+            meta.columns[1].width = Inches(5.4)
+            campo_tabela(meta, "Data", d.get("data"))
+            campo_tabela(meta, "ID do documento", d.get("id_documento"))
+            if d.get("pagina_inicial"):
+                pagina_final = d.get("pagina_final") or d.get("pagina_inicial")
+                campo_tabela(meta, "Páginas", f"{d.get('pagina_inicial')} a {pagina_final}")
+            campo_tabela(meta, "Título de origem", d.get("titulo_origem"))
+            campo_tabela(meta, "Resultado", d.get("resultado_reclamante"))
             if d.get("verbas_deferidas"):
-                campo("Verbas identificadas", ", ".join(d["verbas_deferidas"]))
-            doc.add_paragraph().add_run("DISPOSITIVO:").bold = True
-            doc.add_paragraph(d.get("dispositivo",""))
+                campo_tabela(meta, "Verbas identificadas", ", ".join(d["verbas_deferidas"]))
+            texto_multilinha("Dispositivo", d.get("dispositivo",""))
 
     if criterios and "erro" not in criterios and criterios.get("criterios"):
         h("3. Critérios de Liquidação", 2)
@@ -146,6 +187,13 @@ def gerar_markdown(dados, decisoes, criterios, alertas=None) -> str:
         for i, d in enumerate(decisoes, 1):
             md.append(f"### 2.{i} {d.get('tipo','Decisão')}")
             md.append(f"**Data:** {d.get('data','')}  |  **Resultado:** {d.get('resultado_reclamante','')}")
+            if d.get("id_documento"):
+                md.append(f"**ID do documento:** {d['id_documento']}")
+            if d.get("pagina_inicial"):
+                pagina_final = d.get("pagina_final") or d.get("pagina_inicial")
+                md.append(f"**Páginas:** {d.get('pagina_inicial')} a {pagina_final}")
+            if d.get("titulo_origem"):
+                md.append(f"**Título de origem:** {d['titulo_origem']}")
             if d.get("verbas_deferidas"):
                 md.append(f"**Verbas:** {', '.join(d['verbas_deferidas'])}")
             md.append(f"\n**DISPOSITIVO:**\n\n{d.get('dispositivo','')}\n")

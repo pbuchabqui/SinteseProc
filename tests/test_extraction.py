@@ -55,6 +55,9 @@ def test_extrair_decisao_de_doc_com_dispositivo_resultado_e_verbas():
         "tipo_cat": "sentenca",
         "tipo_label": "Sentença",
         "titulo": "1. 10/04/2024 - Sentença - abc12345",
+        "id_documento": "abc12345",
+        "pagina_inicial": 12,
+        "pagina_final": 14,
         "data": "10/04/2024",
         "texto": """
 SENTENÇA
@@ -69,6 +72,10 @@ Intimem-se.
 
     assert decisao["tipo"] == "Sentença"
     assert decisao["data"] == "10/04/2024"
+    assert decisao["id_documento"] == "abc12345"
+    assert decisao["titulo_origem"] == "1. 10/04/2024 - Sentença - abc12345"
+    assert decisao["pagina_inicial"] == 12
+    assert decisao["pagina_final"] == 14
     assert decisao["resultado_reclamante"] == "parcialmente procedente"
     assert "Ante o exposto" in decisao["dispositivo"]
     assert "Intimem-se" in decisao["dispositivo"]
@@ -186,6 +193,9 @@ def test_buscar_secoes_usa_textos_paginas_ocr_no_toc():
 
     assert secs["documentos_decisao"]
     assert "JULGO PARCIALMENTE" in secs["documentos_decisao"][0]["texto"]
+    assert secs["documentos_decisao"][0]["id_documento"] == "abc12345"
+    assert secs["documentos_decisao"][0]["pagina_inicial"] == 1
+    assert secs["documentos_decisao"][0]["pagina_final"] == 1
 
 
 def test_relatorio_preprocessamento_informa_ocr_e_bloqueio():
