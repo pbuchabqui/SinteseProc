@@ -49,6 +49,15 @@ respeitado o limite máximo mensal do salário de contribuição, observadas as 
 vigentes à época e os valores já recolhidos.
 """
 
+CONHECIMENTO_TRABALHISTA_COMPACTO = """
+## Base trabalhista compacta
+- Horas extras: divisor 180 para bancário comum; divisor 220 para cargo de confiança; base salarial conforme Súmula 264/TST.
+- Reflexos: observar RSR, férias + 1/3, 13º, FGTS, aviso prévio quando cabível e comandos expressos da decisão.
+- Tema 9/TST: RSR majorado repercute em férias, 13º e FGTS somente a partir de 20/03/2023; antes, observar OJ 394/SBDI-1.
+- Atualização: IPCA-E até 31/12/2021 e SELIC a partir de 01/01/2022, sem duplicar juros/correção.
+- INSS/IR: apuração mês a mês sobre valor histórico; IR pela regra do art. 12-A da Lei 7.713/1988 quando aplicável.
+"""
+
 # ── Regras absolutas de análise pericial (de instrucoes-analise.md do ContextAI) ──
 REGRAS_ANALISE = """
 ## Regras absolutas
@@ -79,6 +88,60 @@ PADROES_RELEVANCIA_ALERTAS = re.compile(
     re.IGNORECASE,
 )
 
+INSTRUCAO_CRITERIOS = """
+Analise o dispositivo da sentença/acórdão trabalhista e extraia os critérios de liquidação.
+Use a base de referência jurídica fornecida para preencher critérios não explicitados na sentença
+(ex: se não há índice de correção, aplicar SELIC por ADC 58; se não há divisor, usar o padrão da categoria).
+O texto pode vir em formato de pacote de contexto com Mapa de Evidências. Use apenas essas evidências;
+quando um critério não tiver fonte no pacote, indique a ausência em "observacoes".
+
+{
+  "criterios": {
+    "base_salarial": "descrição da base (ex: última remuneração R$ X)",
+    "periodo_apurado": {"inicio": "dd/mm/aaaa", "fim": "dd/mm/aaaa"},
+    "jornada_contratual": "ex: 8h diárias / 44h semanais",
+    "jornada_real_apurada": "ex: 10h diárias conforme cartões de ponto",
+    "divisor": "220 ou 180 ou outro — justificar",
+    "adicional_horas_extras": "50% ou 100% ou percentual CCT",
+    "reflexos": ["DSR", "férias", "13º salário", "aviso prévio", "FGTS"],
+    "marco_tema9": "aplicar Tema 9/TST a partir de 20/03/2023 se houver RSR majorado",
+    "fgts": {"base": "todas as verbas deferidas", "multa_40": true},
+    "atualizacao_monetaria": "IPCA-E até 31/12/2021 + SELIC a partir de 01/01/2022 (ADC 58)",
+    "juros": "incluídos na SELIC a partir de 01/01/2022",
+    "inss_empregado": "Súmula 26/TRT-4: mês a mês sobre valor histórico",
+    "inss_patronal": "a cargo da reclamada",
+    "ir": "tabela progressiva acumulada (art. 12-A Lei 7.713/1988) ou isento",
+    "exclusoes_expressas": ["ex: dano moral não integra base FGTS"],
+    "observacoes": "outros critérios relevantes incluindo verbas deferidas e deduções autorizadas"
+  }
+}
+"""
+
+INSTRUCAO_ALERTAS = """
+Analise o processo trabalhista e gere os ALERTAS PERICIAIS para o perito.
+Esta é a seção mais importante do relatório — seja específico e prático.
+O texto pode vir em formato de pacote de contexto com Mapa de Evidências. Use apenas essas evidências;
+quando a fonte for OCR ou tiver confiança baixa, indique necessidade de conferência humana.
+
+{
+  "alertas": {
+    "formato_laudo": "PJe-Calc obrigatório | laudo livre | verificar despacho",
+    "prazo_laudo": "data ou 'verificar despacho de nomeação'",
+    "pje_calc_exigido": true,
+    "documentacao_faltante": ["lista do que não está nos autos mas é necessário"],
+    "pontos_atencao": [
+      "alertas específicos do caso — riscos, armadilhas, divergências prováveis"
+    ],
+    "marcos_temporais_criticos": [
+      "ex: contrato anterior a 20/03/2023 — verificar Tema 9/TST para RSR"
+    ],
+    "vincendas": "apurar parcelas vincendas até data-base do laudo (art. 899/CLT)",
+    "honorarios_risco": "OJ 19/TRT-3: divergência significativa pode gerar condenação em honorários",
+    "observacoes_finais": "outros alertas não cobertos acima"
+  }
+}
+"""
+
 
 def _trim_to_limit(text: str, limite: int) -> str:
     if len(text) <= limite:
@@ -107,6 +170,22 @@ def _formatar_decisao_para_contexto(decisao: dict, indice: int) -> str:
 
 def _normalizar_fingerprint(texto: str) -> str:
     return re.sub(r"\W+", "", (texto or "").lower())[:1000]
+
+
+def _tokens_contexto(texto: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-zA-ZÀ-ÿ0-9]{4,}", (texto or "").lower())
+        if token not in {"para", "como", "pela", "pelo", "sobre", "esta", "esse", "isso", "texto"}
+    }
+
+
+def _similaridade_tokens(a: str, b: str) -> float:
+    ta = _tokens_contexto(a)
+    tb = _tokens_contexto(b)
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / max(min(len(ta), len(tb)), 1)
 
 
 def _recortar_texto(texto: str, limite: int) -> str:
@@ -158,6 +237,71 @@ def _novo_bloco_contexto(
         "titulo_origem": titulo_origem or "",
         "ocr_aplicado": bool(ocr_aplicado),
     }
+
+
+def _pontuar_bloco(bloco: dict, objetivo: str) -> int:
+    """Score determinístico: maior = mais útil para o pacote de contexto."""
+    tipo = bloco.get("tipo", "")
+    fonte = bloco.get("fonte", "")
+    texto = bloco.get("texto", "")
+    confianca = bloco.get("confianca", "")
+    prioridade = int(bloco.get("prioridade") or 99)
+
+    pesos_tipo = {
+        "criterios": {
+            "sentenca": 120,
+            "acordao": 112,
+            "embargos": 106,
+            "decisao": 98,
+            "decisao_pagina": 82,
+            "trecho_relevante": 44,
+            "preprocessamento": 20,
+        },
+        "alertas": {
+            "preprocessamento": 112,
+            "decisao": 92,
+            "sentenca": 90,
+            "acordao": 88,
+            "embargos": 86,
+            "calculos": 84,
+            "ponto": 82,
+            "holerite": 80,
+            "ficha": 78,
+            "pagina_alerta": 76,
+            "sumario": 64,
+            "trecho_relevante": 46,
+        },
+    }
+    pesos_fonte = {
+        "decisao_extraida": 32,
+        "secao_detectada": 22,
+        "pagina_pdf": 14,
+        "estrutura_pdf": 12,
+        "busca_textual": 2,
+    }
+    pesos_confianca = {"ALTO": 10, "MÉDIO": 4, "MEDIO": 4, "BAIXO": -8, "CRÍTICO": -16, "CRITICO": -16}
+    score = pesos_tipo.get(objetivo, pesos_tipo["criterios"]).get(tipo, 50)
+    score += pesos_fonte.get(fonte, 0)
+    score += pesos_confianca.get(str(confianca).upper(), 0)
+    score += max(0, 40 - prioridade)
+    if bloco.get("ocr_aplicado"):
+        score += 12 if objetivo == "alertas" else -4
+    if re.search(PADROES_RELEVANCIA_CRITERIOS, texto):
+        score += 14 if objetivo == "criterios" else 4
+    if re.search(PADROES_RELEVANCIA_ALERTAS, texto):
+        score += 14 if objetivo == "alertas" else 2
+    if bloco.get("source_id"):
+        score += 4
+    return score
+
+
+def _enriquecer_blocos(blocos: list[dict], objetivo: str) -> list[dict]:
+    enriquecidos = []
+    for bloco in blocos:
+        copia = dict(bloco)
+        copia["score"] = _pontuar_bloco(copia, objetivo)
+        enriquecidos.append(copia)
+    return enriquecidos
 
 
 def _blocos_decisoes(decisoes: list[dict]) -> list[dict]:
@@ -329,17 +473,25 @@ def _blocos_por_relevancia_textual(texto_completo: str, objetivo: str) -> list[d
 
 def _deduplicar_blocos(blocos: list[dict]) -> list[dict]:
     vistos = set()
-    textos_vistos = []
+    textos_vistos: list[tuple[str, str, str, str]] = []
     unicos = []
-    for bloco in sorted(blocos, key=lambda b: (b["prioridade"], b["tipo"], b["titulo"])):
+    for bloco in sorted(
+        blocos,
+        key=lambda b: (-int(b.get("score", 0)), b.get("prioridade", 99), b["tipo"], b["titulo"]),
+    ):
         texto = bloco.get("texto", "")
         fp = _normalizar_fingerprint(texto)
         if not fp or fp in vistos:
             continue
-        if len(fp) > 120 and any(fp in visto or visto in fp for visto in textos_vistos if len(visto) > 120):
+        if len(fp) > 120 and any(fp in visto or visto in fp for visto, _, _, _ in textos_vistos if len(visto) > 120):
+            continue
+        if bloco.get("tipo") == "trecho_relevante" and any(
+            fonte_vista != "busca_textual" and tipo in TIPOS_CRITERIOS and _similaridade_tokens(texto, texto_visto) >= 0.32
+            for _, texto_visto, tipo, fonte_vista in textos_vistos
+        ):
             continue
         vistos.add(fp)
-        textos_vistos.append(fp)
+        textos_vistos.append((fp, texto, bloco.get("tipo", ""), bloco.get("fonte", "")))
         unicos.append(bloco)
     return unicos
 
@@ -368,6 +520,7 @@ def formatar_evidence_index(blocos: list[dict]) -> str:
             f"pages=\"{_xml_attr(bloco['paginas'])}\" "
             f"confidence=\"{_xml_attr(bloco['confianca'])}\" "
             f"ocr=\"{'true' if bloco.get('ocr_aplicado') else 'false'}\" "
+            f"score=\"{_xml_attr(bloco.get('score'))}\" "
             f"title=\"{_xml_attr(bloco['titulo'])}\" />"
         )
     linhas.append("</evidence_index>")
@@ -383,6 +536,7 @@ def formatar_evidence_xml(bloco: dict, idx: int, limite_texto: int = 4500) -> st
         f"source_id=\"{_xml_attr(bloco.get('source_id'))}\" "
         f"pages=\"{_xml_attr(bloco['paginas'])}\" "
         f"confidence=\"{_xml_attr(bloco['confianca'])}\" "
+        f"score=\"{_xml_attr(bloco.get('score'))}\" "
         f"ocr=\"{'true' if bloco.get('ocr_aplicado') else 'false'}\">",
         f"  <title>{_xml_text(bloco['titulo'])}</title>",
         f"  <origin_title>{_xml_text(bloco.get('titulo_origem'))}</origin_title>",
@@ -432,6 +586,119 @@ def formatar_critical_recap(blocos: list[dict], objetivo: str) -> str:
     return "\n".join(linhas)
 
 
+def formatar_context_brief(
+    blocos: list[dict],
+    objetivo: str,
+    estrutura_pdf: dict | None = None,
+    truncado: bool = False,
+) -> str:
+    classificacao = (estrutura_pdf or {}).get("classificacao_tecnica", {})
+    confianca_global = classificacao.get("confianca_global") or "não informada"
+    decisoes = [b for b in blocos if b["tipo"] in {"sentenca", "acordao", "embargos", "decisao"}]
+    paginas_criticas = [
+        b for b in blocos
+        if b.get("ocr_aplicado") or b.get("confianca") in {"BAIXO", "CRÍTICO", "CRITICO"}
+    ]
+    lacunas = []
+    if objetivo == "criterios" and not decisoes:
+        lacunas.append("nenhuma decisão estruturada extraída; resposta deve marcar critérios sem fonte como ausentes")
+    if confianca_global in {"BAIXO", "CRÍTICO", "CRITICO"}:
+        lacunas.append("confiança global baixa/crítica; exigir conferência humana")
+    if truncado:
+        lacunas.append("houve truncamento; evidências omitidas não podem ser usadas")
+    if not lacunas:
+        lacunas.append("sem lacuna crítica detectada no pacote selecionado")
+
+    linhas = [
+        f"<context_brief objective=\"{_xml_attr(objetivo)}\" confidence_global=\"{_xml_attr(confianca_global)}\">",
+        "  <summary>Pacote de evidências priorizadas para resposta pericial. Use somente o que estiver neste contexto.</summary>",
+        "  <critical_decisions>",
+    ]
+    for idx, bloco in [(i, b) for i, b in enumerate(blocos, 1) if b in decisoes[:5]]:
+        linhas.append(
+            f"    <decision evidence_id=\"EV-{idx:02d}\" type=\"{_xml_attr(bloco['tipo'])}\" "
+            f"pages=\"{_xml_attr(bloco['paginas'])}\" source_id=\"{_xml_attr(bloco.get('source_id'))}\">"
+            f"{_xml_text(bloco['titulo'])}</decision>"
+        )
+    if not decisoes:
+        linhas.append("    <missing>sentença/acórdão/embargos/decisão não selecionados como evidência estruturada</missing>")
+    linhas.append("  </critical_decisions>")
+    linhas.append("  <critical_pages>")
+    for idx, bloco in [(i, b) for i, b in enumerate(blocos, 1) if b in paginas_criticas[:6]]:
+        linhas.append(
+            f"    <page evidence_id=\"EV-{idx:02d}\" pages=\"{_xml_attr(bloco['paginas'])}\" "
+            f"confidence=\"{_xml_attr(bloco['confianca'])}\" ocr=\"{'true' if bloco.get('ocr_aplicado') else 'false'}\" />"
+        )
+    if not paginas_criticas:
+        linhas.append("    <none>sem página OCR/baixa confiança entre as evidências selecionadas</none>")
+    linhas.append("  </critical_pages>")
+    linhas.append("  <known_gaps>")
+    for lacuna in lacunas[:5]:
+        linhas.append(f"    <gap>{_xml_text(lacuna)}</gap>")
+    linhas.append("  </known_gaps>")
+    linhas.append("</context_brief>")
+    return "\n".join(linhas)
+
+
+def formatar_evidence_budget(
+    total_blocos: int,
+    selecionados: list[dict],
+    limite: int,
+    chars_usados: int,
+    truncado: bool,
+    objetivo: str,
+) -> str:
+    omitidos = max(total_blocos - len(selecionados), 0)
+    motivo = "blocos menos relevantes omitidos por orçamento" if truncado or omitidos else "sem truncamento"
+    return "\n".join([
+        f"<evidence_budget objective=\"{_xml_attr(objetivo)}\" limit_chars=\"{limite}\" "
+        f"used_chars=\"{chars_usados}\" total_blocks=\"{total_blocos}\" "
+        f"selected_blocks=\"{len(selecionados)}\" omitted_blocks=\"{omitidos}\">",
+        f"  <budget_policy>Reservar parte do limite para brief, índice, recap crítico, probe e aviso de truncamento.</budget_policy>",
+        f"  <truncation_reason>{_xml_text(motivo)}</truncation_reason>",
+        "</evidence_budget>",
+    ])
+
+
+def formatar_source_priority_rules(objetivo: str) -> str:
+    if objetivo == "alertas":
+        foco = "auditoria PDF, despacho/nomeação, decisões, cálculos, ponto, holerites e páginas OCR/baixa confiança"
+    else:
+        foco = "sentença, acórdão, embargos, decisões, dispositivos e trechos com verbas/índices/reflexos"
+    return "\n".join([
+        f"<source_priority_rules objective=\"{_xml_attr(objetivo)}\">",
+        "  <rule order=\"1\">decisao_extraida: dispositivo e metadados determinísticos prevalecem.</rule>",
+        "  <rule order=\"2\">secao_detectada: fallback textual com menor autoridade que decisão extraída.</rule>",
+        "  <rule order=\"3\">pagina_pdf: página candidata ajuda a auditar fonte, OCR e confiança.</rule>",
+        "  <rule order=\"4\">busca_textual: usar apenas como apoio, nunca contra fonte decisória mais forte.</rule>",
+        f"  <focus>{_xml_text(foco)}</focus>",
+        "</source_priority_rules>",
+    ])
+
+
+def formatar_context_probe(blocos: list[dict], objetivo: str) -> str:
+    tem_decisao = any(b["tipo"] in {"sentenca", "acordao", "embargos", "decisao"} for b in blocos)
+    tem_ocr_baixo = any(b.get("ocr_aplicado") or b.get("confianca") in {"BAIXO", "CRÍTICO", "CRITICO"} for b in blocos)
+    checks = [
+        "Citar apenas evidências listadas no evidence_index.",
+        "Quando faltar fonte para um critério/alerta, escrever ausência de fonte no JSON.",
+    ]
+    if objetivo == "criterios":
+        checks.insert(0, "Verificar sentença, acórdão e embargos antes de preencher critérios.")
+    else:
+        checks.insert(0, "Verificar auditoria PDF, despacho/nomeação, cálculos, ponto e holerites antes dos alertas.")
+    if not tem_decisao:
+        checks.append("Não há decisão estruturada selecionada; não inventar dispositivo.")
+    if tem_ocr_baixo:
+        checks.append("Há OCR ou baixa confiança; indicar conferência humana quando impactar a conclusão.")
+
+    linhas = [f"<context_probe objective=\"{_xml_attr(objetivo)}\">"]
+    for idx, check in enumerate(checks, 1):
+        linhas.append(f"  <check id=\"CP-{idx:02d}\">{_xml_text(check)}</check>")
+    linhas.append("</context_probe>")
+    return "\n".join(linhas)
+
+
 def montar_prompt_tarefa(instrucao: str, contexto: str) -> str:
     contexto = (contexto or "").strip()
     if "<document_context" not in contexto:
@@ -452,12 +719,19 @@ def montar_prompt_tarefa(instrucao: str, contexto: str) -> str:
     ])
 
 
-def selecionar_blocos_contexto(blocos: list[dict], limite: int) -> tuple[list[dict], bool]:
+def selecionar_blocos_contexto(blocos: list[dict], limite: int, objetivo: str = "criterios") -> tuple[list[dict], bool]:
     """Seleciona blocos determinística e deduplicadamente dentro de um orçamento aproximado."""
     selecionados = []
     usado = 0
     truncado = False
-    for bloco in _deduplicar_blocos(blocos):
+    max_busca_textual = 3 if objetivo == "criterios" else 4
+    busca_textual_usada = 0
+    for bloco in _deduplicar_blocos(_enriquecer_blocos(blocos, objetivo)):
+        if bloco.get("fonte") == "busca_textual":
+            if busca_textual_usada >= max_busca_textual:
+                truncado = True
+                continue
+            busca_textual_usada += 1
         custo = min(len(bloco["texto"]), 4500) + 380
         if usado + custo <= limite or not selecionados:
             selecionados.append(bloco)
@@ -489,29 +763,49 @@ def montar_contexto_longo(
     if not blocos:
         return (texto_completo or "")[-limite:]
 
-    orcamento_blocos = max(limite - 4500, int(limite * 0.65))
-    selecionados, truncado = selecionar_blocos_contexto(blocos, orcamento_blocos)
+    reserva_contextual = max(1800, int(limite * 0.10))
+    orcamento_blocos = max(1200, limite - reserva_contextual)
+    candidatos_unicos = _deduplicar_blocos(_enriquecer_blocos(blocos, objetivo))
+    selecionados, truncado = selecionar_blocos_contexto(candidatos_unicos, orcamento_blocos, objetivo=objetivo)
 
-    cabecalho = [
-        f"<document_context objective=\"{_xml_attr(objetivo)}\" format=\"structured_evidence_v1\">",
-        "  <context_rules>",
-        "    Use apenas as evidências abaixo. Se uma informação não estiver nas evidências, marque como ausente ou pendente de conferência.",
-        "    Cada evidência contém fonte, páginas, OCR e confiança técnica quando disponíveis.",
-        "  </context_rules>",
-        _formatar_mapa_evidencias(selecionados),
-        "<evidences>",
-    ]
-    limite_por_bloco = max(1200, min(4500, orcamento_blocos // max(len(selecionados), 1)))
+    limite_por_bloco = max(900, min(4200, orcamento_blocos // max(len(selecionados), 1)))
     corpo = [
         _formatar_bloco_evidencia(bloco, idx, limite_por_bloco)
         for idx, bloco in enumerate(selecionados, 1)
     ]
+    chars_usados = sum(len(item) for item in corpo)
+
+    cabecalho = [
+        f"<document_context objective=\"{_xml_attr(objetivo)}\" format=\"structured_evidence_v2\">",
+        "  <context_rules>",
+        "    Use apenas as evidências abaixo. Se uma informação não estiver nas evidências, marque como ausente ou pendente de conferência.",
+        "    Cada evidência contém fonte, páginas, OCR e confiança técnica quando disponíveis.",
+        "  </context_rules>",
+        formatar_context_brief(selecionados, objetivo, estrutura_pdf=estrutura_pdf, truncado=truncado),
+        formatar_evidence_budget(
+            total_blocos=len(candidatos_unicos),
+            selecionados=selecionados,
+            limite=limite,
+            chars_usados=chars_usados,
+            truncado=truncado,
+            objetivo=objetivo,
+        ),
+        formatar_source_priority_rules(objetivo),
+        _formatar_mapa_evidencias(selecionados),
+        "<evidences>",
+    ]
     fechamento = [
         "</evidences>",
         formatar_critical_recap(selecionados, objetivo),
+        formatar_context_probe(selecionados, objetivo),
     ]
     if truncado:
-        fechamento.append("<truncation_notice>CONTEXTO TRUNCADO: blocos menos relevantes foram omitidos para preservar o orçamento.</truncation_notice>")
+        omitidos = max(len(candidatos_unicos) - len(selecionados), 0)
+        fechamento.append(
+            f"<truncation_notice omitted_blocks=\"{omitidos}\">"
+            "CONTEXTO TRUNCADO: blocos menos relevantes foram omitidos para preservar o orçamento."
+            "</truncation_notice>"
+        )
     fechamento.append("</document_context>")
 
     contexto = "\n\n".join(cabecalho + corpo + fechamento)
@@ -580,6 +874,91 @@ def montar_contexto_criterios(
     return (texto_completo or "")[-limite:]
 
 
+def _label_provedor_manual(provedor: str) -> str:
+    valor = (provedor or "").strip().lower()
+    if "claude" in valor:
+        return "Claude Pro"
+    if "chatgpt" in valor or "gpt" in valor:
+        return "ChatGPT Pro"
+    return "ChatGPT Pro"
+
+
+def _base_trabalhista_para_prompt(contexto: str, instrucao: str) -> str:
+    carga_dinamica = len(contexto or "") + len(instrucao or "")
+    return CONHECIMENTO_TRABALHISTA_COMPACTO if carga_dinamica > 22000 else CONHECIMENTO_TRABALHISTA
+
+
+def _montar_prompt_manual(contexto: str, instrucao: str, provedor: str, objetivo: str) -> str:
+    provedor_label = _label_provedor_manual(provedor)
+    base_trabalhista = _base_trabalhista_para_prompt(contexto, instrucao)
+    cabecalho = "\n".join([
+        "# SinteseProc — pacote manual de IA",
+        f"Provedor sugerido: {provedor_label}",
+        "",
+        "Cole este conteúdo em uma conversa no navegador oficial do provedor indicado.",
+        "Não use informações externas ao pacote de evidências. Se faltar fonte, marque como ausente.",
+        "Responda APENAS com JSON válido, sem texto antes/depois e sem bloco ```json```.",
+        "",
+        "Você é perito contábil trabalhista brasileiro especializado em liquidação de sentença no TRT4.",
+        REGRAS_ANALISE.strip(),
+        "## Base de referência jurídica",
+        base_trabalhista.strip(),
+    ])
+    return "\n\n".join([
+        cabecalho,
+        f"<manual_provider>{_xml_text(provedor_label)}</manual_provider>",
+        f"<manual_objective>{_xml_text(objetivo)}</manual_objective>",
+        montar_prompt_tarefa(instrucao, contexto),
+    ]).strip()
+
+
+def montar_prompt_manual_criterios(contexto: str, provedor: str = "ChatGPT Pro") -> str:
+    """Monta prompt copiável para ChatGPT/Claude sem uso de API."""
+    return _montar_prompt_manual(contexto, INSTRUCAO_CRITERIOS, provedor, "criterios")
+
+
+def montar_prompt_manual_alertas(contexto: str, provedor: str = "ChatGPT Pro") -> str:
+    """Monta prompt copiável para ChatGPT/Claude sem uso de API."""
+    return _montar_prompt_manual(contexto, INSTRUCAO_ALERTAS, provedor, "alertas")
+
+
+def extrair_json_resposta_manual(texto: str) -> dict:
+    """Extrai o primeiro objeto JSON de uma resposta colada manualmente."""
+    texto = (texto or "").strip()
+    if not texto:
+        return {"erro": "Resposta manual vazia."}
+
+    limpo = re.sub(r"```(?:json)?|```", "", texto, flags=re.IGNORECASE).strip()
+    decoder = json.JSONDecoder()
+    for inicio in [0] + [m.start() for m in re.finditer(r"\{", limpo)]:
+        try:
+            obj, _ = decoder.raw_decode(limpo[inicio:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            return obj
+        return {"erro": "JSON manual deve ser um objeto.", "texto_bruto": texto[:1000]}
+
+    return {"erro": "JSON manual inválido ou ausente.", "texto_bruto": texto[:1000]}
+
+
+def validar_resposta_manual(obj: dict, tipo: str) -> dict:
+    """Valida schema mínimo das respostas manuais aceitas pelos exporters."""
+    if not isinstance(obj, dict):
+        return {"valido": False, "erro": "Resposta manual não é um objeto JSON."}
+    if obj.get("erro"):
+        return {"valido": False, "erro": obj["erro"]}
+
+    tipo = (tipo or "").strip().lower()
+    chave = "alertas" if tipo == "alertas" else "criterios"
+    if chave not in obj:
+        return {"valido": False, "erro": f"Resposta manual não contém a chave obrigatória '{chave}'."}
+    if not isinstance(obj.get(chave), dict):
+        return {"valido": False, "erro": f"A chave '{chave}' deve conter um objeto JSON."}
+
+    return {"valido": True, "erro": ""}
+
+
 def chamar_ia(
     txt: str,
     instrucao: str,
@@ -646,34 +1025,8 @@ def ext_criterios(dispositivo: str, get_secret: SecretGetter, groq_key: str, war
     Interpreta o dispositivo da sentença para extrair parâmetros de liquidação.
     Isso exige compreensão semântica — regex não resolve.
     """
-    return chamar_ia(dispositivo, """
-Analise o dispositivo da sentença/acórdão trabalhista e extraia os critérios de liquidação.
-Use a base de referência jurídica fornecida para preencher critérios não explicitados na sentença
-(ex: se não há índice de correção, aplicar SELIC por ADC 58; se não há divisor, usar o padrão da categoria).
-O texto pode vir em formato de pacote de contexto com Mapa de Evidências. Use apenas essas evidências;
-quando um critério não tiver fonte no pacote, indique a ausência em "observacoes".
-
-{
-  "criterios": {
-    "base_salarial": "descrição da base (ex: última remuneração R$ X)",
-    "periodo_apurado": {"inicio": "dd/mm/aaaa", "fim": "dd/mm/aaaa"},
-    "jornada_contratual": "ex: 8h diárias / 44h semanais",
-    "jornada_real_apurada": "ex: 10h diárias conforme cartões de ponto",
-    "divisor": "220 ou 180 ou outro — justificar",
-    "adicional_horas_extras": "50% ou 100% ou percentual CCT",
-    "reflexos": ["DSR", "férias", "13º salário", "aviso prévio", "FGTS"],
-    "marco_tema9": "aplicar Tema 9/TST a partir de 20/03/2023 se houver RSR majorado",
-    "fgts": {"base": "todas as verbas deferidas", "multa_40": true},
-    "atualizacao_monetaria": "IPCA-E até 31/12/2021 + SELIC a partir de 01/01/2022 (ADC 58)",
-    "juros": "incluídos na SELIC a partir de 01/01/2022",
-    "inss_empregado": "Súmula 26/TRT-4: mês a mês sobre valor histórico",
-    "inss_patronal": "a cargo da reclamada",
-    "ir": "tabela progressiva acumulada (art. 12-A Lei 7.713/1988) ou isento",
-    "exclusoes_expressas": ["ex: dano moral não integra base FGTS"],
-    "observacoes": "outros critérios relevantes incluindo verbas deferidas e deduções autorizadas"
-  }
-}
-""", get_secret=get_secret, groq_key=groq_key, limite=30000, incluir_base_trabalhista=True, warning_callback=warning_callback)
+    return chamar_ia(dispositivo, INSTRUCAO_CRITERIOS, get_secret=get_secret, groq_key=groq_key,
+                     limite=30000, incluir_base_trabalhista=True, warning_callback=warning_callback)
 
 
 def ext_alertas_periciais(texto_processo: str, get_secret: SecretGetter, groq_key: str, warning_callback: WarningCallback | None = None) -> dict:
@@ -681,27 +1034,5 @@ def ext_alertas_periciais(texto_processo: str, get_secret: SecretGetter, groq_ke
     Gera a Seção 8 — Alertas Periciais (obrigatória conforme instrucoes-analise.md).
     Usa o texto das decisões + despacho de nomeação para identificar riscos e atenções.
     """
-    return chamar_ia(texto_processo, """
-Analise o processo trabalhista e gere os ALERTAS PERICIAIS para o perito.
-Esta é a seção mais importante do relatório — seja específico e prático.
-O texto pode vir em formato de pacote de contexto com Mapa de Evidências. Use apenas essas evidências;
-quando a fonte for OCR ou tiver confiança baixa, indique necessidade de conferência humana.
-
-{
-  "alertas": {
-    "formato_laudo": "PJe-Calc obrigatório | laudo livre | verificar despacho",
-    "prazo_laudo": "data ou 'verificar despacho de nomeação'",
-    "pje_calc_exigido": true,
-    "documentacao_faltante": ["lista do que não está nos autos mas é necessário"],
-    "pontos_atencao": [
-      "alertas específicos do caso — riscos, armadilhas, divergências prováveis"
-    ],
-    "marcos_temporais_criticos": [
-      "ex: contrato anterior a 20/03/2023 — verificar Tema 9/TST para RSR"
-    ],
-    "vincendas": "apurar parcelas vincendas até data-base do laudo (art. 899/CLT)",
-    "honorarios_risco": "OJ 19/TRT-3: divergência significativa pode gerar condenação em honorários",
-    "observacoes_finais": "outros alertas não cobertos acima"
-  }
-}
-""", get_secret=get_secret, groq_key=groq_key, limite=20000, incluir_base_trabalhista=True, warning_callback=warning_callback)
+    return chamar_ia(texto_processo, INSTRUCAO_ALERTAS, get_secret=get_secret, groq_key=groq_key,
+                     limite=20000, incluir_base_trabalhista=True, warning_callback=warning_callback)

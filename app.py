@@ -8,7 +8,16 @@ import os
 
 import streamlit as st
 
-from sintese.ai import ext_alertas_periciais, ext_criterios, montar_contexto_criterios, montar_contexto_longo
+from sintese.ai import (
+    extrair_json_resposta_manual,
+    ext_alertas_periciais,
+    ext_criterios,
+    montar_contexto_criterios,
+    montar_contexto_longo,
+    montar_prompt_manual_alertas,
+    montar_prompt_manual_criterios,
+    validar_resposta_manual,
+)
 from sintese.exporters import gerar_excel, gerar_json_bytes, gerar_markdown, gerar_word
 from sintese.extraction import (
     aplicar_ocr_necessario,
@@ -42,10 +51,21 @@ def get_secret(k):
         return os.getenv(k)
 
 
+MODO_IA_GROQ = "Groq API"
+MODO_IA_MANUAL = "Manual ChatGPT/Claude"
+PROVEDOR_CHATGPT = "ChatGPT Pro"
+PROVEDOR_CLAUDE = "Claude Pro"
+
 GROQ_KEY = get_secret("GROQ_API_KEY")
-if not GROQ_KEY:
-    st.error("GROQ_API_KEY não configurada. Adicione em Settings → Secrets.")
-    st.stop()
+if GROQ_KEY:
+    modo_ia = st.radio("Modo IA", [MODO_IA_GROQ, MODO_IA_MANUAL], horizontal=True)
+else:
+    modo_ia = MODO_IA_MANUAL
+    st.info("GROQ_API_KEY não configurada. O sistema seguirá em modo manual ChatGPT/Claude.")
+
+provedor_manual = PROVEDOR_CHATGPT
+if modo_ia == MODO_IA_MANUAL:
+    provedor_manual = st.radio("Assistente manual", [PROVEDOR_CHATGPT, PROVEDOR_CLAUDE], horizontal=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # BLOCO 4 — INTERFACE
@@ -91,179 +111,291 @@ if not (o_word or o_md or o_xl):
     st.warning("Selecione pelo menos um arquivo de saída.")
     st.stop()
 
-if not st.button("⚙️ Processar", type="primary"):
+processar_agora = st.button("⚙️ Processar", type="primary")
+if processar_agora:
+    st.session_state.pop("ultimo_resultado", None)
+    st.session_state.pop("resposta_manual_criterios", None)
+    st.session_state.pop("resposta_manual_alertas", None)
+
+if not processar_agora and "ultimo_resultado" not in st.session_state:
     st.stop()
 
 # ── Processamento ─────────────────────────────────────────────────────────────
 
-pdf_bytes = arq.read()
-dados = decisoes_lista = criterios = ficha = ponto = alertas = None
+if processar_agora:
+    pdf_bytes = arq.read()
+    dados = decisoes_lista = criterios = ficha = ponto = alertas = None
+    prompts_manuais = {}
 
-with st.spinner("Lendo PDF..."):
-    doc_fitz, capa, txt, toc, npags = ler_pdf(pdf_bytes)
-    analise_pdf = analisar_pdf_texto(doc_fitz, nome_arquivo=arq.name, tamanho_bytes=arq.size)
-    textos_paginas = list(analise_pdf.get("textos_paginas") or [])
+    with st.spinner("Lendo PDF..."):
+        doc_fitz, capa, txt, toc, npags = ler_pdf(pdf_bytes)
+        analise_pdf = analisar_pdf_texto(doc_fitz, nome_arquivo=arq.name, tamanho_bytes=arq.size)
+        textos_paginas = list(analise_pdf.get("textos_paginas") or [])
 
-st.write(f"✅ {npags} páginas lidas")
-confianca_global = analise_pdf.get("classificacao_tecnica", {}).get("confianca_global")
-if confianca_global:
-    st.caption(f"Classificação técnica: {analise_pdf['tipo_pdf']} — confiança {confianca_global}.")
+    st.write(f"✅ {npags} páginas lidas")
+    confianca_global = analise_pdf.get("classificacao_tecnica", {}).get("confianca_global")
+    if confianca_global:
+        st.caption(f"Classificação técnica: {analise_pdf['tipo_pdf']} — confiança {confianca_global}.")
 
-if analise_pdf["total_precisam_ocr"]:
-    paginas_ocr = ", ".join(map(str, analise_pdf["paginas_precisam_ocr"][:20]))
-    extra = "..." if len(analise_pdf["paginas_precisam_ocr"]) > 20 else ""
-    st.warning(
-        f"🔎 Análise inicial: {analise_pdf['total_precisam_ocr']}/{npags} página(s) precisam de OCR "
-        f"(páginas {paginas_ocr}{extra})."
-    )
-    with st.spinner("Executando OCR nas páginas necessárias..."):
-        ocr = aplicar_ocr_necessario(doc_fitz, analise_pdf, pdf_bytes=pdf_bytes)
-    if ocr["paginas_processadas"]:
-        capa = ocr["capa"]
-        txt = ocr["texto_completo"]
-        textos_paginas = ocr["textos_paginas"]
-        estrutura_pdf = ocr.get("estrutura_pdf") or montar_estrutura_pdf(analise_pdf, textos_paginas)
-        engine = ocr.get("engine") or "ocr"
-        st.write(f"✅ OCR concluído em {len(ocr['paginas_processadas'])} página(s) — motor: {engine}")
-    if ocr["erros"]:
-        paginas_erro = ", ".join(map(str, sorted(ocr["erros"])[:10]))
-        extra_erro = "..." if len(ocr["erros"]) > 10 else ""
+    if analise_pdf["total_precisam_ocr"]:
+        paginas_ocr = ", ".join(map(str, analise_pdf["paginas_precisam_ocr"][:20]))
+        extra = "..." if len(analise_pdf["paginas_precisam_ocr"]) > 20 else ""
         st.warning(
-            f"⚠️ OCR não concluiu em {len(ocr['erros'])} página(s): {paginas_erro}{extra_erro}. "
-            "Verifique se o Tesseract e o idioma português estão disponíveis."
+            f"🔎 Análise inicial: {analise_pdf['total_precisam_ocr']}/{npags} página(s) precisam de OCR "
+            f"(páginas {paginas_ocr}{extra})."
         )
-else:
-    estrutura_pdf = montar_estrutura_pdf(analise_pdf, textos_paginas)
+        with st.spinner("Executando OCR nas páginas necessárias..."):
+            ocr = aplicar_ocr_necessario(doc_fitz, analise_pdf, pdf_bytes=pdf_bytes)
+        if ocr["paginas_processadas"]:
+            capa = ocr["capa"]
+            txt = ocr["texto_completo"]
+            textos_paginas = ocr["textos_paginas"]
+            estrutura_pdf = ocr.get("estrutura_pdf") or montar_estrutura_pdf(analise_pdf, textos_paginas)
+            engine = ocr.get("engine") or "ocr"
+            st.write(f"✅ OCR concluído em {len(ocr['paginas_processadas'])} página(s) — motor: {engine}")
+        if ocr["erros"]:
+            paginas_erro = ", ".join(map(str, sorted(ocr["erros"])[:10]))
+            extra_erro = "..." if len(ocr["erros"]) > 10 else ""
+            st.warning(
+                f"⚠️ OCR não concluiu em {len(ocr['erros'])} página(s): {paginas_erro}{extra_erro}. "
+                "Verifique se o Tesseract e o idioma português estão disponíveis."
+            )
+    else:
+        estrutura_pdf = montar_estrutura_pdf(analise_pdf, textos_paginas)
+        st.write(
+            f"🔎 Análise inicial: texto nativo aproveitável em "
+            f"{analise_pdf['total_nativas']}/{npags} página(s) ({analise_pdf['percentual_nativo']}%)."
+        )
+
+    if "estrutura_pdf" not in locals():
+        estrutura_pdf = montar_estrutura_pdf(analise_pdf, textos_paginas)
+
+    if analise_pdf["total_baixo_texto"] or analise_pdf["total_sem_texto"]:
+        st.caption(
+            f"Páginas com baixo texto: {analise_pdf['total_baixo_texto']} — "
+            f"sem texto detectável: {analise_pdf['total_sem_texto']}."
+        )
+    for alerta_pre in estrutura_pdf.get("alertas", []):
+        st.warning(alerta_pre)
+
+    seguranca_pdf = avaliar_bloqueio_processamento(estrutura_pdf)
+    if seguranca_pdf["mensagem"]:
+        if seguranca_pdf["bloquear"]:
+            st.error(f"🚫 {seguranca_pdf['mensagem']}")
+        else:
+            st.warning(f"⚠️ {seguranca_pdf['mensagem']}")
+
+    secs = buscar_secoes(doc_fitz, toc, txt, textos_paginas=textos_paginas)
+    secoes_ok = list(secs.keys())
     st.write(
-        f"🔎 Análise inicial: texto nativo aproveitável em "
-        f"{analise_pdf['total_nativas']}/{npags} página(s) ({analise_pdf['percentual_nativo']}%)."
+        "✅ Seções localizadas: " + ", ".join(secoes_ok)
+        if secoes_ok
+        else "⚠️ Nenhuma seção localizada por palavra-chave"
     )
 
-if "estrutura_pdf" not in locals():
-    estrutura_pdf = montar_estrutura_pdf(analise_pdf, textos_paginas)
+    if f_dados:
+        with st.spinner("Extraindo dados do processo (regex)..."):
+            dados = extrair_dados(txt, capa)
+        num = dados.get("numero_processo","?")
+        rec = dados.get("reclamante","?")
+        emp = dados.get("reclamada_1","?")
+        st.write(f"✅ Processo {num} — {rec} × {emp}")
 
-if analise_pdf["total_baixo_texto"] or analise_pdf["total_sem_texto"]:
+    if f_decisoes:
+        with st.spinner("Extraindo decisões (texto literal)..."):
+            decisoes_lista = anotar_decisoes_com_auditoria(extrair_decisoes(secs), estrutura_pdf)
+        n = len(decisoes_lista)
+        if n:
+            tipos = ", ".join(d["tipo"] for d in decisoes_lista)
+            st.write(f"✅ {n} decisão(ões): {tipos}")
+        else:
+            st.write("⚠️ Nenhuma decisão localizada")
+
+    if f_criterios:
+        if seguranca_pdf["bloquear"]:
+            st.error("❌ Critérios bloqueados: PDF com confiabilidade técnica crítica.")
+        else:
+            decisoes_para_criterios = decisoes_lista
+            if decisoes_para_criterios is None:
+                decisoes_para_criterios = anotar_decisoes_com_auditoria(extrair_decisoes(secs), estrutura_pdf)
+            contexto_criterios = montar_contexto_criterios(
+                decisoes_para_criterios or [],
+                secs,
+                txt,
+                estrutura_pdf=estrutura_pdf,
+            )
+            if modo_ia == MODO_IA_MANUAL:
+                prompts_manuais["criterios_chatgpt"] = montar_prompt_manual_criterios(contexto_criterios, PROVEDOR_CHATGPT)
+                prompts_manuais["criterios_claude"] = montar_prompt_manual_criterios(contexto_criterios, PROVEDOR_CLAUDE)
+                st.write("✅ Prompt manual de critérios gerado")
+            else:
+                with st.spinner("Extraindo critérios de liquidação (⚡IA — 1 chamada)..."):
+                    criterios = ext_criterios(contexto_criterios, get_secret, GROQ_KEY, st.warning)
+                if "erro" in criterios:
+                    st.error(f"❌ Critérios: {criterios['erro']}")
+                else:
+                    st.write("✅ Critérios extraídos")
+
+    if f_alertas:
+        if seguranca_pdf["bloquear"]:
+            st.error("❌ Alertas IA bloqueados: PDF com confiabilidade técnica crítica.")
+        else:
+            decisoes_para_alertas = decisoes_lista
+            if decisoes_para_alertas is None:
+                decisoes_para_alertas = anotar_decisoes_com_auditoria(extrair_decisoes(secs), estrutura_pdf)
+            texto_alertas = montar_contexto_longo(
+                decisoes_para_alertas or [],
+                secs,
+                txt,
+                estrutura_pdf=estrutura_pdf,
+                objetivo="alertas",
+                limite=20000,
+            )
+            if modo_ia == MODO_IA_MANUAL:
+                prompts_manuais["alertas_chatgpt"] = montar_prompt_manual_alertas(texto_alertas, PROVEDOR_CHATGPT)
+                prompts_manuais["alertas_claude"] = montar_prompt_manual_alertas(texto_alertas, PROVEDOR_CLAUDE)
+                st.write("✅ Prompt manual de alertas gerado")
+            else:
+                with st.spinner("Gerando alertas periciais (⚡IA — 1 chamada)..."):
+                    alertas = ext_alertas_periciais(texto_alertas, get_secret, GROQ_KEY, st.warning)
+                if "erro" in alertas:
+                    st.error(f"❌ Alertas: {alertas['erro']}")
+                else:
+                    n_alertas = len(alertas.get("alertas", {}).get("pontos_atencao", []))
+                    st.write(f"✅ Alertas gerados ({n_alertas} ponto(s) de atenção)")
+
+    if f_ficha:
+        if seguranca_pdf["bloquear"]:
+            ficha = {"erro": "Extração tabular bloqueada por confiabilidade técnica crítica."}
+            st.error(f"❌ Ficha: {ficha['erro']}")
+        else:
+            with st.spinner("Extraindo ficha financeira (tabelas locais)..."):
+                ficha = extrair_ficha(doc_fitz, textos_paginas=textos_paginas, pdf_bytes=pdf_bytes)
+            ficha["validacao"] = validar_ficha(ficha)
+            if "erro" in ficha:
+                st.warning(f"⚠️ Ficha: {ficha['erro']}")
+            else:
+                n = len(ficha.get("competencias",[]))
+                st.write(f"✅ Ficha: {n} competência(s), {len(ficha.get('rubricas',[]))} rubrica(s)")
+            for alerta_ficha in ficha.get("validacao", {}).get("alertas", []):
+                st.warning(f"⚠️ Validação ficha: {alerta_ficha}")
+
+    if f_ponto:
+        if seguranca_pdf["bloquear"]:
+            ponto = {"erro": "Extração tabular bloqueada por confiabilidade técnica crítica."}
+            st.error(f"❌ Ponto: {ponto['erro']}")
+        else:
+            with st.spinner("Extraindo espelho de ponto (tabelas locais)..."):
+                ponto = extrair_ponto(doc_fitz, textos_paginas=textos_paginas, pdf_bytes=pdf_bytes)
+            ponto["validacao"] = validar_ponto(ponto)
+            if "erro" in ponto:
+                st.warning(f"⚠️ Ponto: {ponto['erro']}")
+            else:
+                st.write(f"✅ Ponto: {len(ponto.get('registros',[]))} registro(s)")
+            for alerta_ponto in ponto.get("validacao", {}).get("alertas", []):
+                st.warning(f"⚠️ Validação ponto: {alerta_ponto}")
+
+    doc_fitz.close()
+    st.session_state["ultimo_resultado"] = {
+        "dados": dados,
+        "decisoes_lista": decisoes_lista,
+        "criterios": criterios,
+        "ficha": ficha,
+        "ponto": ponto,
+        "alertas": alertas,
+        "estrutura_pdf": estrutura_pdf,
+        "textos_paginas": textos_paginas,
+        "prompts_manuais": prompts_manuais,
+        "modo_ia": modo_ia,
+        "provedor_manual": provedor_manual,
+    }
+else:
+    resultado = st.session_state["ultimo_resultado"]
+    dados = resultado.get("dados")
+    decisoes_lista = resultado.get("decisoes_lista")
+    criterios = resultado.get("criterios")
+    ficha = resultado.get("ficha")
+    ponto = resultado.get("ponto")
+    alertas = resultado.get("alertas")
+    estrutura_pdf = resultado.get("estrutura_pdf")
+    textos_paginas = resultado.get("textos_paginas") or []
+    prompts_manuais = resultado.get("prompts_manuais") or {}
+    modo_ia = resultado.get("modo_ia", modo_ia)
+    provedor_manual = resultado.get("provedor_manual", provedor_manual)
+    st.info("Usando o último processamento. Clique em Processar para reprocessar o PDF.")
+
+num = (dados or {}).get("numero_processo","processo").replace("-","").replace(".","")
+
+if prompts_manuais:
+    st.subheader("🤝 IA manual")
     st.caption(
-        f"Páginas com baixo texto: {analise_pdf['total_baixo_texto']} — "
-        f"sem texto detectável: {analise_pdf['total_sem_texto']}."
+        "Copie o prompt para o ChatGPT/Claude no navegador oficial e cole abaixo a resposta JSON recebida."
     )
-for alerta_pre in estrutura_pdf.get("alertas", []):
-    st.warning(alerta_pre)
 
-seguranca_pdf = avaliar_bloqueio_processamento(estrutura_pdf)
-if seguranca_pdf["mensagem"]:
-    if seguranca_pdf["bloquear"]:
-        st.error(f"🚫 {seguranca_pdf['mensagem']}")
-    else:
-        st.warning(f"⚠️ {seguranca_pdf['mensagem']}")
+    def _receber_resposta_manual(tipo: str, titulo: str, valor_atual: dict | None) -> dict | None:
+        chave_chatgpt = f"{tipo}_chatgpt"
+        chave_claude = f"{tipo}_claude"
+        chave_prompt = chave_claude if provedor_manual == PROVEDOR_CLAUDE else chave_chatgpt
+        prompt = prompts_manuais.get(chave_prompt)
+        if not prompt:
+            return valor_atual
 
-secs = buscar_secoes(doc_fitz, toc, txt, textos_paginas=textos_paginas)
-secoes_ok = list(secs.keys())
-st.write(
-    "✅ Seções localizadas: " + ", ".join(secoes_ok)
-    if secoes_ok
-    else "⚠️ Nenhuma seção localizada por palavra-chave"
-)
+        with st.expander(f"Prompt manual — {titulo}", expanded=valor_atual is None):
+            st.text_area(
+                f"Prompt para copiar — {titulo} ({provedor_manual})",
+                prompt,
+                height=260,
+                key=f"prompt_manual_{chave_prompt}",
+            )
+            c_prompt_1, c_prompt_2 = st.columns(2)
+            with c_prompt_1:
+                if prompts_manuais.get(chave_chatgpt):
+                    st.download_button(
+                        f"⬇️ Prompt {titulo} ChatGPT (.txt)",
+                        prompts_manuais[chave_chatgpt].encode(),
+                        f"prompt_{tipo}_chatgpt_{num}.txt",
+                        "text/plain",
+                    )
+            with c_prompt_2:
+                if prompts_manuais.get(chave_claude):
+                    st.download_button(
+                        f"⬇️ Prompt {titulo} Claude (.txt)",
+                        prompts_manuais[chave_claude].encode(),
+                        f"prompt_{tipo}_claude_{num}.txt",
+                        "text/plain",
+                    )
 
-if f_dados:
-    with st.spinner("Extraindo dados do processo (regex)..."):
-        dados = extrair_dados(txt, capa)
-    num = dados.get("numero_processo","?")
-    rec = dados.get("reclamante","?")
-    emp = dados.get("reclamada_1","?")
-    st.write(f"✅ Processo {num} — {rec} × {emp}")
+            resposta = st.text_area(
+                f"Cole aqui a resposta JSON — {titulo}",
+                height=180,
+                key=f"resposta_manual_{tipo}",
+            )
+            if not resposta.strip():
+                if valor_atual and "erro" not in valor_atual:
+                    st.success(f"✅ {titulo}: resposta manual já validada")
+                else:
+                    st.warning(f"⚠️ {titulo}: aguardando resposta manual em JSON")
+                return valor_atual
 
-if f_decisoes:
-    with st.spinner("Extraindo decisões (texto literal)..."):
-        decisoes_lista = anotar_decisoes_com_auditoria(extrair_decisoes(secs), estrutura_pdf)
-    n = len(decisoes_lista)
-    if n:
-        tipos = ", ".join(d["tipo"] for d in decisoes_lista)
-        st.write(f"✅ {n} decisão(ões): {tipos}")
-    else:
-        st.write("⚠️ Nenhuma decisão localizada")
+            parsed = extrair_json_resposta_manual(resposta)
+            validacao = validar_resposta_manual(parsed, tipo)
+            if not validacao["valido"]:
+                st.error(f"❌ {titulo}: {validacao['erro']}")
+                return valor_atual
 
-if f_criterios:
-    if seguranca_pdf["bloquear"]:
-        st.error("❌ Critérios bloqueados: PDF com confiabilidade técnica crítica.")
-    else:
-        decisoes_para_criterios = decisoes_lista
-        if decisoes_para_criterios is None:
-            decisoes_para_criterios = anotar_decisoes_com_auditoria(extrair_decisoes(secs), estrutura_pdf)
-        contexto_criterios = montar_contexto_criterios(
-            decisoes_para_criterios or [],
-            secs,
-            txt,
-            estrutura_pdf=estrutura_pdf,
-        )
-        with st.spinner("Extraindo critérios de liquidação (⚡IA — 1 chamada)..."):
-            criterios = ext_criterios(contexto_criterios, get_secret, GROQ_KEY, st.warning)
-        if "erro" in criterios:
-            st.error(f"❌ Critérios: {criterios['erro']}")
-        else:
-            st.write("✅ Critérios extraídos")
+            st.success(f"✅ {titulo}: resposta manual validada")
+            st.session_state["ultimo_resultado"][tipo] = parsed
+            return parsed
 
-if f_alertas:
-    if seguranca_pdf["bloquear"]:
-        st.error("❌ Alertas IA bloqueados: PDF com confiabilidade técnica crítica.")
-    else:
-        decisoes_para_alertas = decisoes_lista
-        if decisoes_para_alertas is None:
-            decisoes_para_alertas = anotar_decisoes_com_auditoria(extrair_decisoes(secs), estrutura_pdf)
-        texto_alertas = montar_contexto_longo(
-            decisoes_para_alertas or [],
-            secs,
-            txt,
-            estrutura_pdf=estrutura_pdf,
-            objetivo="alertas",
-            limite=20000,
-        )
-        with st.spinner("Gerando alertas periciais (⚡IA — 1 chamada)..."):
-            alertas = ext_alertas_periciais(texto_alertas, get_secret, GROQ_KEY, st.warning)
-        if "erro" in alertas:
-            st.error(f"❌ Alertas: {alertas['erro']}")
-        else:
-            n_alertas = len(alertas.get("alertas", {}).get("pontos_atencao", []))
-            st.write(f"✅ Alertas gerados ({n_alertas} ponto(s) de atenção)")
-
-if f_ficha:
-    if seguranca_pdf["bloquear"]:
-        ficha = {"erro": "Extração tabular bloqueada por confiabilidade técnica crítica."}
-        st.error(f"❌ Ficha: {ficha['erro']}")
-    else:
-        with st.spinner("Extraindo ficha financeira (tabelas locais)..."):
-            ficha = extrair_ficha(doc_fitz, textos_paginas=textos_paginas, pdf_bytes=pdf_bytes)
-        ficha["validacao"] = validar_ficha(ficha)
-        if "erro" in ficha:
-            st.warning(f"⚠️ Ficha: {ficha['erro']}")
-        else:
-            n = len(ficha.get("competencias",[]))
-            st.write(f"✅ Ficha: {n} competência(s), {len(ficha.get('rubricas',[]))} rubrica(s)")
-        for alerta_ficha in ficha.get("validacao", {}).get("alertas", []):
-            st.warning(f"⚠️ Validação ficha: {alerta_ficha}")
-
-if f_ponto:
-    if seguranca_pdf["bloquear"]:
-        ponto = {"erro": "Extração tabular bloqueada por confiabilidade técnica crítica."}
-        st.error(f"❌ Ponto: {ponto['erro']}")
-    else:
-        with st.spinner("Extraindo espelho de ponto (tabelas locais)..."):
-            ponto = extrair_ponto(doc_fitz, textos_paginas=textos_paginas, pdf_bytes=pdf_bytes)
-        ponto["validacao"] = validar_ponto(ponto)
-        if "erro" in ponto:
-            st.warning(f"⚠️ Ponto: {ponto['erro']}")
-        else:
-            st.write(f"✅ Ponto: {len(ponto.get('registros',[]))} registro(s)")
-        for alerta_ponto in ponto.get("validacao", {}).get("alertas", []):
-            st.warning(f"⚠️ Validação ponto: {alerta_ponto}")
-
-doc_fitz.close()
+    if prompts_manuais.get("criterios_chatgpt") or prompts_manuais.get("criterios_claude"):
+        criterios = _receber_resposta_manual("criterios", "Critérios de liquidação", criterios)
+    if prompts_manuais.get("alertas_chatgpt") or prompts_manuais.get("alertas_claude"):
+        alertas = _receber_resposta_manual("alertas", "Alertas periciais", alertas)
 
 # ── Downloads ─────────────────────────────────────────────────────────────────
 
 st.success("✅ Concluído!")
 st.subheader("📥 Downloads")
-num = (dados or {}).get("numero_processo","processo").replace("-","").replace(".","")
 
 if o_word:
     with st.spinner("Gerando Word..."):

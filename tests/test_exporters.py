@@ -77,3 +77,32 @@ def test_gerar_json_bytes_serializa_utf8():
     payload = gerar_json_bytes({"confiança": "BAIXO"})
 
     assert json.loads(payload.decode("utf-8")) == {"confiança": "BAIXO"}
+
+
+def test_exporters_aceitam_respostas_manuais_no_schema_atual():
+    criterios = {
+        "criterios": {
+            "base_salarial": "salário base contratual",
+            "periodo_apurado": {"inicio": "01/01/2020", "fim": "31/12/2020"},
+            "divisor": "220",
+            "reflexos": ["FGTS"],
+            "fgts": {"base": "horas extras", "multa_40": False},
+        }
+    }
+    alertas = {
+        "alertas": {
+            "formato_laudo": "PJe-Calc obrigatório",
+            "prazo_laudo": "verificar despacho",
+            "pje_calc_exigido": True,
+            "pontos_atencao": ["conferir OCR"],
+        }
+    }
+
+    docx_bytes = gerar_word({}, [], criterios, alertas)
+    md = gerar_markdown({}, [], criterios, alertas)
+
+    assert docx_bytes.startswith(b"PK")
+    assert "Critérios de Liquidação" in md
+    assert "salário base contratual" in md
+    assert "Alertas Periciais" in md
+    assert "conferir OCR" in md
