@@ -2,10 +2,13 @@ import sintese.extraction as extraction
 from sintese.extraction import (
     aplicar_ocr_necessario,
     analisar_pdf_texto,
+    buscar_secoes,
     classificar_pagina_texto,
     executar_ocr_paginas,
     extrair_dados,
     extrair_decisao_de_doc,
+    gerar_relatorio_preprocessamento_pdf,
+    montar_estrutura_pdf,
     _formatar_intervalos_paginas,
 )
 
@@ -125,6 +128,82 @@ def test_analisar_pdf_texto_resume_pdf_misto():
     assert analise["paginas_precisam_ocr"] == [2]
     assert analise["paginas_baixo_texto"] == [3]
     assert analise["percentual_nativo"] == 33.3
+    assert analise["classificacao_tecnica"]["necessita_ocr"] is True
+    assert analise["classificacao_tecnica"]["confianca_global"] in {"MÉDIO", "BAIXO"}
+
+
+def test_analisar_pdf_texto_identifica_sumario_e_candidatos():
+    class PaginaFake:
+        def __init__(self, texto):
+            self._texto = texto
+
+        def get_text(self):
+            return self._texto
+
+        def get_images(self, full=True):
+            return []
+
+        def get_drawings(self):
+            return []
+
+    paginas = [
+        PaginaFake("SENTENÇA\nAnte o exposto, julgo procedente o pedido."),
+        PaginaFake("Cartão de ponto 01/01/2024 08:00 12:00 13:00 17:00"),
+        PaginaFake("ÍNDICE\nRelação de documentos do processo"),
+    ]
+
+    analise = analisar_pdf_texto(paginas, nome_arquivo="autos.pdf", tamanho_bytes=123)
+    estrutura = montar_estrutura_pdf(analise)
+
+    assert analise["arquivo"]["nome"] == "autos.pdf"
+    assert analise["sumario"]["detectado"] is True
+    assert analise["auditoria"]["paginas_candidatas_decisoes"] == 1
+    assert analise["auditoria"]["paginas_candidatas_ponto"] == 1
+    assert any(b["nome"] == "bloco_possiveis_decisoes" for b in estrutura["blocos_sugeridos"])
+
+
+def test_buscar_secoes_usa_textos_paginas_ocr_no_toc():
+    class PaginaFake:
+        def get_text(self):
+            return ""
+
+    class DocFake:
+        def __init__(self):
+            self.paginas = [PaginaFake()]
+
+        def __len__(self):
+            return len(self.paginas)
+
+        def __getitem__(self, index):
+            return self.paginas[index]
+
+    toc = [[1, "1. 10/04/2024 - Sentença - abc12345", 1]]
+    textos_paginas = [
+        "SENTENÇA\nAnte o exposto, JULGO PARCIALMENTE PROCEDENTES os pedidos. Intimem-se."
+    ]
+
+    secs = buscar_secoes(DocFake(), toc, "", textos_paginas=textos_paginas)
+
+    assert secs["documentos_decisao"]
+    assert "JULGO PARCIALMENTE" in secs["documentos_decisao"][0]["texto"]
+
+
+def test_relatorio_preprocessamento_informa_ocr_e_bloqueio():
+    estrutura = {
+        "arquivo": {"nome": "autos.pdf", "paginas_totais": 1, "tamanho_bytes": 10, "criptografado": False},
+        "classificacao_tecnica": {"tipo_pdf": "escaneado", "confianca_global": "BAIXO", "necessita_ocr": True},
+        "sumario": {"detectado": False, "pagina_inicial_pdf": None, "pagina_final_pdf": None},
+        "paginas": [{"pagina_pdf": 1, "alertas": ["página sem texto extraível"]}],
+        "blocos_sugeridos": [],
+        "auditoria": {"paginas_totais": 1, "paginas_ocr": 1, "alertas_emitidos": 1},
+        "alertas": ["conferência humana necessária"],
+    }
+
+    relatorio = gerar_relatorio_preprocessamento_pdf(estrutura)
+
+    assert "Relatório de Pré-Processamento" in relatorio
+    assert "Confiança global: BAIXO" in relatorio
+    assert "conferência humana necessária" in relatorio
 
 
 def test_aplicar_ocr_necessario_reconstroi_texto_com_paginas_processadas(monkeypatch):

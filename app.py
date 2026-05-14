@@ -8,7 +8,7 @@ import os
 
 import streamlit as st
 
-from sintese.ai import ext_alertas_periciais, ext_criterios, montar_contexto_criterios
+from sintese.ai import ext_alertas_periciais, ext_criterios, montar_contexto_criterios, montar_contexto_longo
 from sintese.exporters import gerar_excel, gerar_markdown, gerar_word
 from sintese.extraction import (
     aplicar_ocr_necessario,
@@ -18,6 +18,7 @@ from sintese.extraction import (
     extrair_decisoes,
     extrair_ficha,
     extrair_ponto,
+    montar_estrutura_pdf,
     ler_pdf,
 )
 
@@ -94,9 +95,13 @@ dados = decisoes_lista = criterios = ficha = ponto = alertas = None
 
 with st.spinner("Lendo PDF..."):
     doc_fitz, capa, txt, toc, npags = ler_pdf(pdf_bytes)
-    analise_pdf = analisar_pdf_texto(doc_fitz)
+    analise_pdf = analisar_pdf_texto(doc_fitz, nome_arquivo=arq.name, tamanho_bytes=arq.size)
+    textos_paginas = list(analise_pdf.get("textos_paginas") or [])
 
 st.write(f"✅ {npags} páginas lidas")
+confianca_global = analise_pdf.get("classificacao_tecnica", {}).get("confianca_global")
+if confianca_global:
+    st.caption(f"Classificação técnica: {analise_pdf['tipo_pdf']} — confiança {confianca_global}.")
 
 if analise_pdf["total_precisam_ocr"]:
     paginas_ocr = ", ".join(map(str, analise_pdf["paginas_precisam_ocr"][:20]))
@@ -110,6 +115,8 @@ if analise_pdf["total_precisam_ocr"]:
     if ocr["paginas_processadas"]:
         capa = ocr["capa"]
         txt = ocr["texto_completo"]
+        textos_paginas = ocr["textos_paginas"]
+        estrutura_pdf = ocr.get("estrutura_pdf") or montar_estrutura_pdf(analise_pdf, textos_paginas)
         engine = ocr.get("engine") or "ocr"
         st.write(f"✅ OCR concluído em {len(ocr['paginas_processadas'])} página(s) — motor: {engine}")
     if ocr["erros"]:
@@ -120,18 +127,24 @@ if analise_pdf["total_precisam_ocr"]:
             "Verifique se o Tesseract e o idioma português estão disponíveis."
         )
 else:
+    estrutura_pdf = montar_estrutura_pdf(analise_pdf, textos_paginas)
     st.write(
         f"🔎 Análise inicial: texto nativo aproveitável em "
         f"{analise_pdf['total_nativas']}/{npags} página(s) ({analise_pdf['percentual_nativo']}%)."
     )
+
+if "estrutura_pdf" not in locals():
+    estrutura_pdf = montar_estrutura_pdf(analise_pdf, textos_paginas)
 
 if analise_pdf["total_baixo_texto"] or analise_pdf["total_sem_texto"]:
     st.caption(
         f"Páginas com baixo texto: {analise_pdf['total_baixo_texto']} — "
         f"sem texto detectável: {analise_pdf['total_sem_texto']}."
     )
+for alerta_pre in estrutura_pdf.get("alertas", []):
+    st.warning(alerta_pre)
 
-secs = buscar_secoes(doc_fitz, toc, txt)
+secs = buscar_secoes(doc_fitz, toc, txt, textos_paginas=textos_paginas)
 secoes_ok = list(secs.keys())
 st.write(
     "✅ Seções localizadas: " + ", ".join(secoes_ok)
@@ -161,7 +174,12 @@ if f_criterios:
     decisoes_para_criterios = decisoes_lista
     if decisoes_para_criterios is None:
         decisoes_para_criterios = extrair_decisoes(secs)
-    contexto_criterios = montar_contexto_criterios(decisoes_para_criterios or [], secs, txt)
+    contexto_criterios = montar_contexto_criterios(
+        decisoes_para_criterios or [],
+        secs,
+        txt,
+        estrutura_pdf=estrutura_pdf,
+    )
     with st.spinner("Extraindo critérios de liquidação (⚡IA — 1 chamada)..."):
         criterios = ext_criterios(contexto_criterios, get_secret, GROQ_KEY, st.warning)
     if "erro" in criterios:
@@ -170,12 +188,17 @@ if f_criterios:
         st.write("✅ Critérios extraídos")
 
 if f_alertas:
-    # Usa sentença + decisões + despacho de nomeação como fonte
-    texto_alertas = "\n\n".join(filter(None, [
-        secs.get("sentenca","")[:10000],
-        secs.get("acordao","")[:5000],
-        secs.get("decisao","")[:5000],
-    ])) or txt[-20000:]
+    decisoes_para_alertas = decisoes_lista
+    if decisoes_para_alertas is None:
+        decisoes_para_alertas = extrair_decisoes(secs)
+    texto_alertas = montar_contexto_longo(
+        decisoes_para_alertas or [],
+        secs,
+        txt,
+        estrutura_pdf=estrutura_pdf,
+        objetivo="alertas",
+        limite=20000,
+    )
     with st.spinner("Gerando alertas periciais (⚡IA — 1 chamada)..."):
         alertas = ext_alertas_periciais(texto_alertas, get_secret, GROQ_KEY, st.warning)
     if "erro" in alertas:
@@ -186,7 +209,7 @@ if f_alertas:
 
 if f_ficha:
     with st.spinner("Extraindo ficha financeira (tabelas PyMuPDF)..."):
-        ficha = extrair_ficha(doc_fitz)
+        ficha = extrair_ficha(doc_fitz, textos_paginas=textos_paginas)
     if "erro" in ficha:
         st.warning(f"⚠️ Ficha: {ficha['erro']}")
     else:
@@ -195,7 +218,7 @@ if f_ficha:
 
 if f_ponto:
     with st.spinner("Extraindo espelho de ponto (tabelas PyMuPDF)..."):
-        ponto = extrair_ponto(doc_fitz)
+        ponto = extrair_ponto(doc_fitz, textos_paginas=textos_paginas)
     if "erro" in ponto:
         st.warning(f"⚠️ Ponto: {ponto['erro']}")
     else:

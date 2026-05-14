@@ -1,6 +1,7 @@
 """Report exporters for SinteseProc."""
 
 import io
+import math
 
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -258,9 +259,10 @@ def aba_ponto_xl(ws, ponto):
     regs = ponto["registros"]
     n_max = max((len(r.get("entradas_saidas",[])) for r in regs), default=4)
     n_max = max(n_max,2)
+    pares = max(1, math.ceil(n_max / 2))
     cabs = ["Data","Dia"]
-    for i in range(1,n_max//2+1): cabs += [f"E{i}",f"S{i}"]
-    cabs += ["H.Trab.","H.Extra","Observação"]
+    for i in range(1, pares + 1): cabs += [f"E{i}",f"S{i}"]
+    cabs += ["Col_R1","Col_R2","Col_R3","Col_R4","Observação","Detalhe","H.Trab.","H.Extra"]
     for ci,t in enumerate(cabs,1):
         c = ws.cell(1,ci,t); _cab(c)
         ws.column_dimensions[get_column_letter(ci)].width = 12
@@ -268,10 +270,13 @@ def aba_ponto_xl(ws, ponto):
         ws.cell(li,1,reg.get("data","")); ws.cell(li,2,reg.get("dia_semana",""))
         for ci,hs in enumerate(reg.get("entradas_saidas",[]),3):
             ws.cell(li,ci,hs)
-        ultimo = 2+n_max
-        ws.cell(li,ultimo+1,reg.get("horas_trabalhadas",""))
-        ws.cell(li,ultimo+2,reg.get("horas_extras",""))
-        ws.cell(li,ultimo+3,reg.get("observacao",""))
+        ultimo = 2 + (pares * 2)
+        for offset in range(1, 5):
+            ws.cell(li, ultimo + offset, 0)
+        ws.cell(li,ultimo+5,reg.get("observacao",""))
+        ws.cell(li,ultimo+6,reg.get("detalhe",""))
+        ws.cell(li,ultimo+7,reg.get("horas_trabalhadas",""))
+        ws.cell(li,ultimo+8,reg.get("horas_extras",""))
     ws.freeze_panes = "A2"
 
 def gerar_excel(dados, ficha, ponto, inc_pag, inc_pto) -> bytes:

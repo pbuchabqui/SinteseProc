@@ -64,6 +64,21 @@ SecretGetter = Callable[[str], str | None]
 WarningCallback = Callable[[str], None]
 
 
+TIPOS_CRITERIOS = {"sentenca", "acordao", "embargos", "decisao"}
+TIPOS_ALERTAS = {"sentenca", "acordao", "embargos", "decisao", "ponto", "ficha", "calculos", "sumario"}
+PADROES_RELEVANCIA_CRITERIOS = re.compile(
+    r"horas extras|adicional|reflexos?|FGTS|INSS|IRRF|corre[çc][aã]o|SELIC|IPCA|"
+    r"juros|divisor|base de c[áa]lculo|liquida[çc][aã]o|condeno|julgo",
+    re.IGNORECASE,
+)
+PADROES_RELEVANCIA_ALERTAS = re.compile(
+    r"per[íi]cia|perito|nomea[çc][aã]o|prazo|PJe-Calc|quesitos?|documenta[çc][aã]o|"
+    r"cart[aã]o de ponto|holerite|ficha financeira|c[áa]lculo|liquida[çc][aã]o|"
+    r"impugna[çc][aã]o|diverg[êe]ncia|honor[áa]rios",
+    re.IGNORECASE,
+)
+
+
 def _trim_to_limit(text: str, limite: int) -> str:
     if len(text) <= limite:
         return text
@@ -84,11 +99,327 @@ def _formatar_decisao_para_contexto(decisao: dict, indice: int) -> str:
     return "\n".join(partes)
 
 
+def _normalizar_fingerprint(texto: str) -> str:
+    return re.sub(r"\W+", "", (texto or "").lower())[:1000]
+
+
+def _recortar_texto(texto: str, limite: int) -> str:
+    texto = (texto or "").strip()
+    if len(texto) <= limite:
+        return texto
+    metade = max((limite - 80) // 2, 0)
+    return (
+        texto[:metade].rstrip()
+        + "\n[... TRECHO INTERMEDIÁRIO OMITIDO PARA CABER NO ORÇAMENTO ...]\n"
+        + texto[-metade:].lstrip()
+    )[:limite]
+
+
+def _extrair_texto_pagina(texto_completo: str, pagina: int, limite: int = 3500) -> str:
+    if not texto_completo or not pagina:
+        return ""
+    padrao = re.compile(
+        rf"\[PÁGINA {pagina}\]\n(.*?)(?=\n\[PÁGINA \d+\]\n|\Z)",
+        re.DOTALL,
+    )
+    m = padrao.search(texto_completo)
+    return _recortar_texto(m.group(1), limite) if m else ""
+
+
+def _novo_bloco_contexto(
+    tipo: str,
+    prioridade: int,
+    texto: str,
+    fonte: str,
+    titulo: str = "",
+    paginas: str = "",
+    confianca: str = "",
+    motivo: str = "",
+) -> dict:
+    return {
+        "tipo": tipo,
+        "prioridade": prioridade,
+        "texto": (texto or "").strip(),
+        "fonte": fonte,
+        "titulo": titulo or tipo.capitalize(),
+        "paginas": paginas or "não informada",
+        "confianca": confianca or "não informada",
+        "motivo": motivo or "relevância documental",
+    }
+
+
+def _blocos_decisoes(decisoes: list[dict]) -> list[dict]:
+    blocos = []
+    for indice, decisao in enumerate(decisoes or [], 1):
+        tipo_label = decisao.get("tipo", "Decisão")
+        tipo_norm = tipo_label.lower()
+        if "senten" in tipo_norm:
+            tipo = "sentenca"
+            prioridade = 10
+        elif "acórd" in tipo_norm or "acord" in tipo_norm:
+            tipo = "acordao"
+            prioridade = 20 + indice
+        elif "embargo" in tipo_norm:
+            tipo = "embargos"
+            prioridade = 25 + indice
+        else:
+            tipo = "decisao"
+            prioridade = 35 + indice
+        texto = _formatar_decisao_para_contexto(decisao, indice)
+        blocos.append(_novo_bloco_contexto(
+            tipo=tipo,
+            prioridade=prioridade,
+            texto=texto,
+            fonte="decisao_extraida",
+            titulo=f"Decisão {indice}: {tipo_label}",
+            confianca="ALTO",
+            motivo="dispositivo e metadados extraídos deterministicamente",
+        ))
+    return blocos
+
+
+def _blocos_secoes(secs: dict, objetivo: str) -> list[dict]:
+    prioridades = {
+        "sentenca": 12,
+        "acordao": 22,
+        "embargos": 28,
+        "decisao": 36,
+        "ficha": 60,
+        "ponto": 62,
+        "calculos": 64,
+        "sumario": 70,
+    }
+    tipos = TIPOS_CRITERIOS if objetivo == "criterios" else TIPOS_ALERTAS
+    blocos = []
+    for tipo in prioridades:
+        if tipo not in tipos:
+            continue
+        texto = secs.get(tipo)
+        if not texto:
+            continue
+        blocos.append(_novo_bloco_contexto(
+            tipo=tipo,
+            prioridade=prioridades[tipo],
+            texto=texto,
+            fonte="secao_detectada",
+            titulo=f"Seção detectada: {tipo}",
+            motivo="fallback determinístico de seção textual",
+        ))
+    return blocos
+
+
+def _blocos_estrutura_pdf(estrutura_pdf: dict | None, texto_completo: str, objetivo: str) -> list[dict]:
+    if not estrutura_pdf:
+        return []
+    blocos = []
+    classificacao = estrutura_pdf.get("classificacao_tecnica", {})
+    auditoria = estrutura_pdf.get("auditoria", {})
+    alertas = estrutura_pdf.get("alertas") or []
+    resumo = [
+        "Classificação técnica do PDF:",
+        f"- Tipo: {classificacao.get('tipo_pdf') or 'não informado'}",
+        f"- Confiança global: {classificacao.get('confianca_global') or 'não informada'}",
+        f"- Necessita OCR: {'sim' if classificacao.get('necessita_ocr') else 'não'}",
+        f"- Páginas OCRizadas: {auditoria.get('paginas_ocr', 0)}",
+        f"- Páginas candidatas a decisões: {auditoria.get('paginas_candidatas_decisoes', 0)}",
+        f"- Páginas candidatas a ponto: {auditoria.get('paginas_candidatas_ponto', 0)}",
+        f"- Páginas candidatas a holerites: {auditoria.get('paginas_candidatas_holerites', 0)}",
+        f"- Páginas candidatas a cálculos: {auditoria.get('paginas_candidatas_calculos', 0)}",
+    ]
+    if alertas:
+        resumo.append("Alertas técnicos: " + " | ".join(alertas))
+    blocos.append(_novo_bloco_contexto(
+        tipo="preprocessamento",
+        prioridade=5 if objetivo == "alertas" else 80,
+        texto="\n".join(resumo),
+        fonte="estrutura_pdf",
+        titulo="Auditoria técnica do PDF",
+        confianca=classificacao.get("confianca_global") or "",
+        motivo="rastreabilidade e qualidade da extração",
+    ))
+
+    if objetivo == "criterios":
+        tipos_aceitos = {"decisao"}
+    else:
+        tipos_aceitos = {"decisao", "ponto", "holerite", "calculos", "sumario"}
+
+    for pagina in estrutura_pdf.get("paginas") or []:
+        possiveis = set(pagina.get("possiveis_tipos") or [])
+        if not (possiveis & tipos_aceitos):
+            continue
+        pagina_pdf = pagina.get("pagina_pdf")
+        texto_pagina = _extrair_texto_pagina(texto_completo, pagina_pdf)
+        if not texto_pagina and not pagina.get("alertas"):
+            continue
+        tipo = sorted(possiveis & tipos_aceitos)[0]
+        prioridade = {
+            "decisao": 38,
+            "calculos": 48,
+            "ponto": 52,
+            "holerite": 54,
+            "sumario": 68,
+        }.get(tipo, 75)
+        texto = texto_pagina or "Alertas da página: " + " | ".join(pagina.get("alertas") or [])
+        blocos.append(_novo_bloco_contexto(
+            tipo=tipo,
+            prioridade=prioridade,
+            texto=texto,
+            fonte="pagina_pdf",
+            titulo=f"Página candidata: {tipo}",
+            paginas=str(pagina_pdf),
+            confianca=pagina.get("confianca") or "",
+            motivo="página candidata identificada no pré-processamento",
+        ))
+    return blocos
+
+
+def _blocos_por_relevancia_textual(texto_completo: str, objetivo: str) -> list[dict]:
+    if not texto_completo:
+        return []
+    padrao = PADROES_RELEVANCIA_CRITERIOS if objetivo == "criterios" else PADROES_RELEVANCIA_ALERTAS
+    blocos = []
+    for m in padrao.finditer(texto_completo):
+        inicio = max(m.start() - 900, 0)
+        fim = min(m.end() + 1800, len(texto_completo))
+        trecho = texto_completo[inicio:fim]
+        pagina_m = re.findall(r"\[PÁGINA (\d+)\]", texto_completo[max(0, inicio - 80):m.start()])
+        pagina = pagina_m[-1] if pagina_m else ""
+        blocos.append(_novo_bloco_contexto(
+            tipo="trecho_relevante",
+            prioridade=78 + len(blocos),
+            texto=trecho,
+            fonte="busca_textual",
+            titulo=f"Trecho por palavra-chave: {m.group(0)}",
+            paginas=pagina,
+            motivo="termo relevante localizado no texto completo",
+        ))
+        if len(blocos) >= 8:
+            break
+    return blocos
+
+
+def _deduplicar_blocos(blocos: list[dict]) -> list[dict]:
+    vistos = set()
+    textos_vistos = []
+    unicos = []
+    for bloco in sorted(blocos, key=lambda b: (b["prioridade"], b["tipo"], b["titulo"])):
+        texto = bloco.get("texto", "")
+        fp = _normalizar_fingerprint(texto)
+        if not fp or fp in vistos:
+            continue
+        if len(fp) > 120 and any(fp in visto or visto in fp for visto in textos_vistos if len(visto) > 120):
+            continue
+        vistos.add(fp)
+        textos_vistos.append(fp)
+        unicos.append(bloco)
+    return unicos
+
+
+def _formatar_mapa_evidencias(blocos: list[dict]) -> str:
+    linhas = [
+        "## Mapa de Evidências",
+        "| ID | Tipo | Fonte | Páginas | Confiança | Motivo |",
+        "|---|---|---|---|---|---|",
+    ]
+    for idx, bloco in enumerate(blocos, 1):
+        linhas.append(
+            f"| EV-{idx:02d} | {bloco['tipo']} | {bloco['fonte']} | "
+            f"{bloco['paginas']} | {bloco['confianca']} | {bloco['motivo']} |"
+        )
+    return "\n".join(linhas)
+
+
+def _formatar_bloco_evidencia(bloco: dict, idx: int, limite_texto: int) -> str:
+    texto = _recortar_texto(bloco["texto"], limite_texto)
+    return "\n".join([
+        f"### EV-{idx:02d} — {bloco['titulo']}",
+        f"Tipo: {bloco['tipo']} | Fonte: {bloco['fonte']} | Páginas: {bloco['paginas']} | Confiança: {bloco['confianca']}",
+        f"Motivo: {bloco['motivo']}",
+        "",
+        texto,
+    ])
+
+
+def selecionar_blocos_contexto(blocos: list[dict], limite: int) -> tuple[list[dict], bool]:
+    """Seleciona blocos determinística e deduplicadamente dentro de um orçamento aproximado."""
+    selecionados = []
+    usado = 0
+    truncado = False
+    for bloco in _deduplicar_blocos(blocos):
+        custo = min(len(bloco["texto"]), 4500) + 380
+        if usado + custo <= limite or not selecionados:
+            selecionados.append(bloco)
+            usado += custo
+        else:
+            truncado = True
+    return selecionados, truncado
+
+
+def montar_contexto_longo(
+    decisoes: list[dict] | None,
+    secs: dict | None,
+    texto_completo: str,
+    estrutura_pdf: dict | None = None,
+    objetivo: str = "criterios",
+    limite: int = 30000,
+) -> str:
+    """Monta contexto IA com evidências priorizadas, orçamento e mitigação lost-in-the-middle."""
+    decisoes = decisoes or []
+    secs = secs or {}
+    objetivo = objetivo if objetivo in {"criterios", "alertas"} else "criterios"
+
+    blocos = []
+    blocos.extend(_blocos_decisoes(decisoes))
+    blocos.extend(_blocos_secoes(secs, objetivo))
+    blocos.extend(_blocos_estrutura_pdf(estrutura_pdf, texto_completo, objetivo))
+    blocos.extend(_blocos_por_relevancia_textual(texto_completo, objetivo))
+
+    if not blocos:
+        return (texto_completo or "")[-limite:]
+
+    orcamento_blocos = max(limite - 4500, int(limite * 0.65))
+    selecionados, truncado = selecionar_blocos_contexto(blocos, orcamento_blocos)
+
+    cabecalho = [
+        f"# Pacote de Contexto — {objetivo}",
+        "",
+        "Use apenas as evidências abaixo. Se uma informação não estiver nas evidências, marque como ausente ou pendente de conferência.",
+        "Cada evidência contém fonte, páginas e confiança técnica quando disponíveis.",
+        "",
+        _formatar_mapa_evidencias(selecionados),
+        "",
+        "## Evidências Priorizadas",
+    ]
+    limite_por_bloco = max(1200, min(4500, orcamento_blocos // max(len(selecionados), 1)))
+    corpo = [
+        _formatar_bloco_evidencia(bloco, idx, limite_por_bloco)
+        for idx, bloco in enumerate(selecionados, 1)
+    ]
+    reforco = [
+        "## Reforço Final — Pontos Críticos",
+        "Releia especialmente as evidências de menor ID, pois foram priorizadas por força decisória/pericial.",
+    ]
+    for idx, bloco in enumerate(selecionados[:4], 1):
+        reforco.append(
+            f"- EV-{idx:02d}: {bloco['tipo']} em {bloco['fonte']} "
+            f"(páginas {bloco['paginas']}, confiança {bloco['confianca']})."
+        )
+    if truncado:
+        reforco.append("[CONTEXTO TRUNCADO: blocos menos relevantes foram omitidos para preservar o orçamento.]")
+
+    contexto = "\n\n".join(cabecalho + corpo + ["\n".join(reforco)])
+    if len(contexto) <= limite:
+        return contexto
+    aviso = "[CONTEXTO TRUNCADO: evidências críticas preservadas no início e no reforço final.]\n\n"
+    return aviso + contexto[: max(limite - len(aviso), 0)]
+
+
 def montar_contexto_criterios(
     decisoes: list[dict] | None,
     secs: dict | None,
     texto_completo: str,
     limite: int = 30000,
+    estrutura_pdf: dict | None = None,
 ) -> str:
     """Monta o texto enviado à IA para critérios de liquidação.
 
@@ -97,6 +428,16 @@ def montar_contexto_criterios(
     """
     decisoes = decisoes or []
     secs = secs or {}
+
+    if estrutura_pdf:
+        return montar_contexto_longo(
+            decisoes,
+            secs,
+            texto_completo,
+            estrutura_pdf=estrutura_pdf,
+            objetivo="criterios",
+            limite=limite,
+        )
 
     if decisoes:
         blocos = [_formatar_decisao_para_contexto(decisao, i) for i, decisao in enumerate(decisoes, 1)]
@@ -154,7 +495,7 @@ def chamar_ia(
                 + REGRAS_ANALISE
                 + (f"\n\n## Base de referência jurídica\n{base}" if base else "")
                 + "\n\nResponda APENAS com JSON válido, sem texto antes/depois, sem ```json```.")},
-            {"role":"user","content":f"{instrucao}\n\nTEXTO:\n{txt[:limite]}"},
+            {"role":"user","content":f"{instrucao}\n\nTEXTO:\n{_recortar_texto(txt, limite)}"},
         ]
     )
     if usa_raciocinio:
@@ -196,6 +537,8 @@ def ext_criterios(dispositivo: str, get_secret: SecretGetter, groq_key: str, war
 Analise o dispositivo da sentença/acórdão trabalhista e extraia os critérios de liquidação.
 Use a base de referência jurídica fornecida para preencher critérios não explicitados na sentença
 (ex: se não há índice de correção, aplicar SELIC por ADC 58; se não há divisor, usar o padrão da categoria).
+O texto pode vir em formato de pacote de contexto com Mapa de Evidências. Use apenas essas evidências;
+quando um critério não tiver fonte no pacote, indique a ausência em "observacoes".
 
 {
   "criterios": {
@@ -228,6 +571,8 @@ def ext_alertas_periciais(texto_processo: str, get_secret: SecretGetter, groq_ke
     return chamar_ia(texto_processo, """
 Analise o processo trabalhista e gere os ALERTAS PERICIAIS para o perito.
 Esta é a seção mais importante do relatório — seja específico e prático.
+O texto pode vir em formato de pacote de contexto com Mapa de Evidências. Use apenas essas evidências;
+quando a fonte for OCR ou tiver confiança baixa, indique necessidade de conferência humana.
 
 {
   "alertas": {

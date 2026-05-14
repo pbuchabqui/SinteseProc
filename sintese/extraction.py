@@ -15,6 +15,7 @@ IDIOMA_OCR_PADRAO = "por+eng"
 OCR_DPI_PADRAO = 300
 OCR_JOBS_MAX = 4
 OCRMY_PDF_MIN_PAGINAS = 1
+CONFIANCA_BLOQUEIO = {"BAIXO", "CRÍTICO"}
 
 
 def ler_pdf(b: bytes) -> tuple[fitz.Document, str, str, list, int]:
@@ -36,6 +37,48 @@ def extrair_textos_paginas(doc: fitz.Document) -> list[str]:
 def juntar_textos_paginas(textos_paginas: list[str]) -> str:
     paginas = [f"[PÁGINA {i+1}]\n{texto}" for i, texto in enumerate(textos_paginas)]
     return "\n".join(paginas)
+
+
+def _confianca_por_status(status: str, total_chars: int, total_palavras: int, tem_visual: bool) -> str:
+    if status == "nativo":
+        return "ALTO"
+    if status == "precisa_ocr":
+        return "BAIXO"
+    if status == "sem_texto":
+        return "CRÍTICO" if tem_visual else "BAIXO"
+    if total_chars >= 40 or total_palavras >= 8:
+        return "MÉDIO"
+    return "BAIXO"
+
+
+def _possiveis_tipos_pagina(texto: str) -> list[str]:
+    tipos = []
+    padroes = [
+        ("decisao", r"SENTEN[ÇC]A|AC[ÓO]RD[ÃA]O|ANTE\s+O\s+EXPOSTO|JULGO|DECIDO|EMBARGOS\s+DE\s+DECLARA"),
+        ("ponto", r"CART[AÃ]O\s+DE\s+PONTO|ESPELHO\s+DE\s+PONTO|REGISTRO\s+DE\s+PONTO|\b\d{2}:\d{2}\b"),
+        ("holerite", r"HOLERITE|CONTRACHEQUE|FICHA\s+FINANCEIRA|FOLHA\s+DE\s+PAGAMENTO|PROVENTOS|DESCONTOS"),
+        ("calculos", r"MEM[ÓO]RIA\s+DE\s+C[ÁA]LCULO|DEMONSTRATIVO\s+DE\s+C[ÁA]LCULO|ATUALIZA[ÇC][ÃA]O|JUROS|SELIC|IPCA"),
+        ("sumario", r"\b[ÍI]NDICE\b|SUM[ÁA]RIO|RELA[ÇC][ÃA]O\s+DE\s+DOCUMENTOS|DOCUMENTOS\s+DO\s+PROCESSO"),
+    ]
+    for nome, padrao in padroes:
+        if re.search(padrao, texto or "", re.IGNORECASE):
+            tipos.append(nome)
+    return tipos
+
+
+def _alertas_pagina(texto: str, status: str, total_imagens: int, total_desenhos: int) -> list[str]:
+    alertas = []
+    if status == "precisa_ocr":
+        alertas.append("página com conteúdo visual e texto nativo insuficiente")
+    if status == "sem_texto":
+        alertas.append("página sem texto extraível")
+    if status == "baixo_texto":
+        alertas.append("texto nativo baixo ou fragmentado")
+    if re.search(r"\b\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{0,3}\b", texto or ""):
+        alertas.append("possível número de processo incompleto")
+    if total_imagens and total_desenhos:
+        alertas.append("página híbrida com imagens e elementos vetoriais")
+    return alertas
 
 
 def classificar_pagina_texto(
@@ -66,21 +109,69 @@ def classificar_pagina_texto(
         status = "baixo_texto"
         precisa_ocr = False
 
+    confianca = _confianca_por_status(status, total_chars, total_palavras, tem_conteudo_visual)
+
     return {
         "status": status,
         "precisa_ocr": precisa_ocr,
+        "confianca": confianca,
+        "texto_extraivel": total_chars > 0,
         "chars": total_chars,
         "palavras": total_palavras,
         "imagens": total_imagens,
         "desenhos": total_desenhos,
+        "possiveis_tipos": _possiveis_tipos_pagina(texto_limpo),
+        "alertas": _alertas_pagina(texto_limpo, status, total_imagens, total_desenhos),
     }
 
 
-def analisar_pdf_texto(doc: fitz.Document) -> dict:
+def _confianca_global(detalhes: list[dict], paginas_precisam_ocr: list[int]) -> str:
+    if not detalhes:
+        return "CRÍTICO"
+    if any(p["confianca"] == "CRÍTICO" for p in detalhes):
+        return "CRÍTICO"
+    total = len(detalhes)
+    baixo = sum(1 for p in detalhes if p["confianca"] == "BAIXO")
+    medio = sum(1 for p in detalhes if p["confianca"] == "MÉDIO")
+    if baixo / total >= 0.35:
+        return "BAIXO"
+    if paginas_precisam_ocr or medio:
+        return "MÉDIO"
+    return "ALTO"
+
+
+def _buscar_sumario_final(detalhes: list[dict], janela: int = 40) -> dict:
+    candidatos = [p for p in detalhes[-janela:] if "sumario" in p.get("possiveis_tipos", [])]
+    if not candidatos:
+        candidatos = [p for p in detalhes if "sumario" in p.get("possiveis_tipos", [])]
+    if not candidatos:
+        return {
+            "detectado": False,
+            "pagina_inicial_pdf": None,
+            "pagina_final_pdf": None,
+            "confianca": "",
+            "observacoes": ["Sumário/índice PJe não localizado por texto."],
+        }
+    return {
+        "detectado": True,
+        "pagina_inicial_pdf": candidatos[0]["pagina"],
+        "pagina_final_pdf": candidatos[-1]["pagina"],
+        "confianca": "ALTO" if all(p["confianca"] in {"ALTO", "MÉDIO"} for p in candidatos) else "MÉDIO",
+        "observacoes": [],
+    }
+
+
+def _contar_tipo(detalhes: list[dict], tipo: str) -> int:
+    return sum(1 for p in detalhes if tipo in p.get("possiveis_tipos", []))
+
+
+def analisar_pdf_texto(doc: fitz.Document, nome_arquivo: str = "", tamanho_bytes: int = 0) -> dict:
     """Analisa se o PDF tem texto nativo aproveitável ou páginas que pedem OCR."""
     detalhes = []
+    textos_paginas = []
     for idx, pagina in enumerate(doc, 1):
         texto = pagina.get_text()
+        textos_paginas.append(texto)
         try:
             total_imagens = len(pagina.get_images(full=True))
         except Exception:
@@ -91,6 +182,8 @@ def analisar_pdf_texto(doc: fitz.Document) -> dict:
             total_desenhos = 0
         info = classificar_pagina_texto(texto, total_imagens, total_desenhos)
         info["pagina"] = idx
+        info["pagina_pdf"] = idx
+        info["ocr_aplicado"] = False
         detalhes.append(info)
 
     total = len(detalhes)
@@ -110,6 +203,31 @@ def analisar_pdf_texto(doc: fitz.Document) -> dict:
     else:
         tipo_pdf = "baixo_texto"
 
+    possui_tabelas = any(
+        tipo in p.get("possiveis_tipos", [])
+        for p in detalhes
+        for tipo in ("ponto", "holerite", "calculos")
+    )
+    sumario = _buscar_sumario_final(detalhes)
+    confianca_global = _confianca_global(detalhes, paginas_precisam_ocr)
+    try:
+        criptografado = bool(getattr(doc, "needs_pass", False))
+    except Exception:
+        criptografado = False
+    try:
+        metadados = dict(getattr(doc, "metadata", {}) or {})
+    except Exception:
+        metadados = {}
+
+    alertas = []
+    if criptografado:
+        alertas.append("PDF criptografado ou com restrição de acesso.")
+    if confianca_global in CONFIANCA_BLOQUEIO:
+        alertas.append(
+            "A confiabilidade técnica do PDF é insuficiente para transcrição ou extração automática segura. "
+            "É necessária conferência humana das páginas indicadas antes do uso pericial."
+        )
+
     return {
         "tipo_pdf": tipo_pdf,
         "total_paginas": total,
@@ -123,6 +241,38 @@ def analisar_pdf_texto(doc: fitz.Document) -> dict:
         "paginas_baixo_texto": paginas_baixo_texto,
         "paginas_sem_texto": paginas_sem_texto,
         "detalhes_paginas": detalhes,
+        "textos_paginas": textos_paginas,
+        "classificacao_tecnica": {
+            "tipo_pdf": tipo_pdf,
+            "confianca_global": confianca_global,
+            "necessita_ocr": bool(paginas_precisam_ocr),
+            "possui_tabelas": possui_tabelas,
+            "possui_sumario": sumario["detectado"],
+        },
+        "sumario": sumario,
+        "auditoria": {
+            "paginas_totais": total,
+            "paginas_texto_nativo": len(paginas_nativas),
+            "paginas_ocr": 0,
+            "paginas_ocr_baixo": 0,
+            "paginas_ilegiveis": len([p for p in detalhes if p["confianca"] == "CRÍTICO"]),
+            "paginas_em_branco": len(paginas_sem_texto),
+            "tabelas_detectadas": 0,
+            "tabelas_extraidas": 0,
+            "paginas_candidatas_decisoes": _contar_tipo(detalhes, "decisao"),
+            "paginas_candidatas_ponto": _contar_tipo(detalhes, "ponto"),
+            "paginas_candidatas_holerites": _contar_tipo(detalhes, "holerite"),
+            "paginas_candidatas_calculos": _contar_tipo(detalhes, "calculos"),
+            "alertas_emitidos": len(alertas) + sum(len(p.get("alertas", [])) for p in detalhes),
+        },
+        "arquivo": {
+            "nome": nome_arquivo,
+            "paginas_totais": total,
+            "tamanho_bytes": tamanho_bytes,
+            "criptografado": criptografado,
+            "metadados": metadados,
+        },
+        "alertas": alertas,
     }
 
 
@@ -299,7 +449,8 @@ def aplicar_ocr_necessario(
 ) -> dict:
     """Executa OCR nas páginas sinalizadas e reconstrói capa/texto completo."""
     paginas = list(analise_pdf.get("paginas_precisam_ocr") or [])
-    textos_paginas = extrair_textos_paginas(doc)
+    textos_paginas = list(analise_pdf.get("textos_paginas") or extrair_textos_paginas(doc))
+    detalhes_paginas = [dict(p) for p in analise_pdf.get("detalhes_paginas", [])]
 
     if not paginas:
         return {
@@ -309,6 +460,8 @@ def aplicar_ocr_necessario(
             "textos_paginas": textos_paginas,
             "capa": textos_paginas[0] if textos_paginas else "",
             "texto_completo": juntar_textos_paginas(textos_paginas),
+            "detalhes_paginas": detalhes_paginas,
+            "estrutura_pdf": montar_estrutura_pdf(analise_pdf, textos_paginas=textos_paginas),
         }
 
     resultado = executar_ocr_paginas(
@@ -321,6 +474,46 @@ def aplicar_ocr_necessario(
     for pagina_num, texto in resultado["textos_ocr"].items():
         if texto.strip() and 1 <= pagina_num <= len(textos_paginas):
             textos_paginas[pagina_num - 1] = texto
+            if pagina_num <= len(detalhes_paginas):
+                detalhes_paginas[pagina_num - 1]["ocr_aplicado"] = True
+                detalhes_paginas[pagina_num - 1]["confianca"] = "MÉDIO"
+                detalhes_paginas[pagina_num - 1]["texto_extraivel"] = True
+                detalhes_paginas[pagina_num - 1]["chars"] = len(re.sub(r"\s+", " ", texto).strip())
+                detalhes_paginas[pagina_num - 1]["palavras"] = len(re.findall(r"\w+", texto, re.UNICODE))
+                detalhes_paginas[pagina_num - 1]["possiveis_tipos"] = _possiveis_tipos_pagina(texto)
+                detalhes_paginas[pagina_num - 1]["alertas"] = ["texto obtido por OCR; conferir trechos decisórios literais"]
+
+    analise_atualizada = dict(analise_pdf)
+    analise_atualizada["detalhes_paginas"] = detalhes_paginas
+    analise_atualizada["textos_paginas"] = textos_paginas
+    auditoria = dict(analise_atualizada.get("auditoria", {}))
+    auditoria["paginas_ocr"] = len(resultado["paginas_processadas"])
+    auditoria["paginas_ocr_baixo"] = len(resultado["erros"])
+    auditoria["alertas_emitidos"] = len(analise_atualizada.get("alertas", [])) + sum(
+        len(p.get("alertas", [])) for p in detalhes_paginas
+    )
+    analise_atualizada["auditoria"] = auditoria
+    analise_atualizada["classificacao_tecnica"] = dict(analise_atualizada.get("classificacao_tecnica", {}))
+    analise_atualizada["classificacao_tecnica"]["necessita_ocr"] = bool(resultado["erros"])
+    confianca_atualizada = _confianca_global(
+        detalhes_paginas,
+        sorted(resultado["erros"]),
+    )
+    analise_atualizada["classificacao_tecnica"]["confianca_global"] = confianca_atualizada
+    alertas_atualizados = [
+        a for a in analise_atualizada.get("alertas", [])
+        if "confiabilidade técnica do PDF é insuficiente" not in a
+    ]
+    if confianca_atualizada in CONFIANCA_BLOQUEIO:
+        alertas_atualizados.append(
+            "A confiabilidade técnica do PDF é insuficiente para transcrição ou extração automática segura. "
+            "É necessária conferência humana das páginas indicadas antes do uso pericial."
+        )
+    analise_atualizada["alertas"] = alertas_atualizados
+    auditoria["alertas_emitidos"] = len(alertas_atualizados) + sum(
+        len(p.get("alertas", [])) for p in detalhes_paginas
+    )
+    analise_atualizada["auditoria"] = auditoria
 
     return {
         "executado": True,
@@ -333,7 +526,121 @@ def aplicar_ocr_necessario(
         "dpi": dpi,
         "engine": resultado.get("engine"),
         "jobs": resultado.get("jobs"),
+        "detalhes_paginas": detalhes_paginas,
+        "estrutura_pdf": montar_estrutura_pdf(analise_atualizada, textos_paginas=textos_paginas),
     }
+
+
+def montar_estrutura_pdf(analise_pdf: dict, textos_paginas: list[str] | None = None) -> dict:
+    """Monta um resumo auditável do pré-processamento em formato serializável."""
+    detalhes = analise_pdf.get("detalhes_paginas", [])
+    textos_paginas = textos_paginas or analise_pdf.get("textos_paginas") or []
+    blocos = []
+    for tipo, nome in [
+        ("decisao", "bloco_possiveis_decisoes"),
+        ("ponto", "bloco_cartoes_ponto"),
+        ("holerite", "bloco_holerites"),
+        ("calculos", "bloco_calculos"),
+    ]:
+        paginas = [p["pagina"] for p in detalhes if tipo in p.get("possiveis_tipos", [])]
+        if paginas:
+            blocos.append({
+                "nome": nome,
+                "pagina_inicial_pdf": min(paginas),
+                "pagina_final_pdf": max(paginas),
+                "motivo": f"páginas com indícios textuais de {tipo}",
+                "confianca": "MÉDIO",
+            })
+
+    paginas = []
+    for idx, info in enumerate(detalhes):
+        texto = textos_paginas[idx] if idx < len(textos_paginas) else ""
+        paginas.append({
+            "pagina_pdf": info.get("pagina", idx + 1),
+            "texto_extraivel": bool(texto.strip() or info.get("texto_extraivel")),
+            "ocr_aplicado": bool(info.get("ocr_aplicado")),
+            "confianca": info.get("confianca", ""),
+            "possiveis_tipos": info.get("possiveis_tipos", []),
+            "alertas": info.get("alertas", []),
+        })
+
+    return {
+        "arquivo": analise_pdf.get("arquivo", {}),
+        "classificacao_tecnica": analise_pdf.get("classificacao_tecnica", {}),
+        "sumario": analise_pdf.get("sumario", {}),
+        "paginas": paginas,
+        "blocos_sugeridos": blocos,
+        "tabelas": [],
+        "auditoria": analise_pdf.get("auditoria", {}),
+        "alertas": analise_pdf.get("alertas", []),
+    }
+
+
+def gerar_relatorio_preprocessamento_pdf(estrutura_pdf: dict) -> str:
+    """Gera relatório técnico curto sobre qualidade, OCR e blocos candidatos."""
+    arquivo = estrutura_pdf.get("arquivo", {})
+    cls = estrutura_pdf.get("classificacao_tecnica", {})
+    aud = estrutura_pdf.get("auditoria", {})
+    sumario = estrutura_pdf.get("sumario", {})
+    linhas = [
+        "# Relatório de Pré-Processamento do PDF",
+        "",
+        "## 1. Dados do Arquivo",
+        f"- Nome: {arquivo.get('nome') or ''}",
+        f"- Páginas: {arquivo.get('paginas_totais') or aud.get('paginas_totais') or 0}",
+        f"- Tamanho: {arquivo.get('tamanho_bytes') or 0} bytes",
+        f"- Criptografado: {'sim' if arquivo.get('criptografado') else 'não'}",
+        "",
+        "## 2. Classificação Técnica",
+        f"- Tipo: {cls.get('tipo_pdf') or ''}",
+        f"- Confiança global: {cls.get('confianca_global') or ''}",
+        f"- Necessita OCR: {'sim' if cls.get('necessita_ocr') else 'não'}",
+        f"- Possui indícios de tabelas: {'sim' if cls.get('possui_tabelas') else 'não'}",
+        "",
+        "## 3. Pesquisabilidade e OCR",
+        f"- Páginas com texto nativo: {aud.get('paginas_texto_nativo', 0)}",
+        f"- Páginas OCRizadas: {aud.get('paginas_ocr', 0)}",
+        f"- Páginas ilegíveis/críticas: {aud.get('paginas_ilegiveis', 0)}",
+        "",
+        "## 4. Sumário / Índice PJe",
+        f"- Detectado: {'sim' if sumario.get('detectado') else 'não'}",
+        f"- Páginas: {sumario.get('pagina_inicial_pdf')} a {sumario.get('pagina_final_pdf')}",
+        "",
+        "## 5. Blocos Documentais Sugeridos",
+    ]
+    blocos = estrutura_pdf.get("blocos_sugeridos") or []
+    if blocos:
+        for bloco in blocos:
+            linhas.append(
+                f"- {bloco.get('nome')}: páginas {bloco.get('pagina_inicial_pdf')} a "
+                f"{bloco.get('pagina_final_pdf')} ({bloco.get('confianca')})"
+            )
+    else:
+        linhas.append("- Nenhum bloco sugerido por heurística textual.")
+
+    linhas += [
+        "",
+        "## 6. Alertas",
+    ]
+    alertas = list(estrutura_pdf.get("alertas") or [])
+    for pagina in estrutura_pdf.get("paginas") or []:
+        for alerta in pagina.get("alertas", []):
+            alertas.append(f"Página {pagina.get('pagina_pdf')}: {alerta}")
+    if alertas:
+        linhas.extend(f"- {alerta}" for alerta in alertas)
+    else:
+        linhas.append("- Nenhum alerta técnico relevante.")
+
+    linhas += [
+        "",
+        "## 7. Auditoria Técnica",
+        f"- Páginas candidatas a decisões: {aud.get('paginas_candidatas_decisoes', 0)}",
+        f"- Páginas candidatas a ponto: {aud.get('paginas_candidatas_ponto', 0)}",
+        f"- Páginas candidatas a holerites: {aud.get('paginas_candidatas_holerites', 0)}",
+        f"- Páginas candidatas a cálculos: {aud.get('paginas_candidatas_calculos', 0)}",
+        f"- Alertas emitidos: {aud.get('alertas_emitidos', 0)}",
+    ]
+    return "\n".join(linhas)
 
 
 # ── 1.1 Dados do processo (regex) ────────────────────────────────────────────
@@ -465,7 +772,7 @@ def extrair_dados(txt: str, capa: str = "") -> dict:
 
 # ── 1.2 Localizar seções (busca bidirecional) ─────────────────────────────────
 
-def buscar_secoes(doc: fitz.Document, toc: list, txt: str) -> dict:
+def buscar_secoes(doc: fitz.Document, toc: list, txt: str, textos_paginas: list[str] | None = None) -> dict:
     """
     Quando o TOC está disponível (PDFs PJe), cada documento é identificado
     individualmente com tipo, data e páginas exatas.
@@ -485,6 +792,16 @@ def buscar_secoes(doc: fitz.Document, toc: list, txt: str) -> dict:
     DECISOES_CATS = {"sentenca", "acordao", "embargos", "decisao"}
     npags = len(doc)
     sec = {"documentos_decisao": []}
+    textos_paginas = textos_paginas or []
+
+    def texto_intervalo(p0: int, p1: int) -> str:
+        blocos = []
+        for i in range(p0, min(p1 + 1, npags)):
+            if i < len(textos_paginas):
+                blocos.append(textos_paginas[i])
+            else:
+                blocos.append(doc[i].get_text())
+        return "\n".join(blocos)
 
     # Títulos a excluir — não são decisões, são notificações ou petições
     EXCLUIR = re.compile(
@@ -521,7 +838,7 @@ def buscar_secoes(doc: fitz.Document, toc: list, txt: str) -> dict:
 
             pag_fim = (toc[idx+1][2] - 1) if idx+1 < len(toc) else npags
             p0, p1 = pag_ini - 1, pag_fim - 1  # 0-based
-            texto_doc = "\n".join(doc[i].get_text() for i in range(p0, min(p1+1, npags)))
+            texto_doc = texto_intervalo(p0, p1)
 
             # Data do título do TOC (confiável)
             data_m = re.search(r"(\d{2}/\d{2}/\d{4})", titulo)
@@ -802,7 +1119,7 @@ def extrair_decisoes(secs: dict) -> list[dict]:
 
 # ── 1.4 Ficha financeira (PyMuPDF tabelas — sem IA) ───────────────────────────
 
-def extrair_ficha(doc: fitz.Document) -> dict:
+def extrair_ficha(doc: fitz.Document, textos_paginas: list[str] | None = None) -> dict:
     """
     Extrai ficha financeira usando detecção de tabelas do PyMuPDF.
     Sem IA — dados tabulares são determinísticos.
@@ -810,8 +1127,9 @@ def extrair_ficha(doc: fitz.Document) -> dict:
     rubricas_set = set()
     competencias = []
 
-    for pagina in doc:
-        texto_pag = pagina.get_text()
+    textos_paginas = textos_paginas or []
+    for idx, pagina in enumerate(doc):
+        texto_pag = textos_paginas[idx] if idx < len(textos_paginas) else pagina.get_text()
         # Verificar se esta página tem ficha financeira
         if not re.search(
             r"FICHA FINANCEIRA|CONTRACHEQUE|HOLERITE|FOLHA DE PAGAMENTO",
@@ -884,7 +1202,7 @@ def extrair_ficha(doc: fitz.Document) -> dict:
 
 # ── 1.5 Espelho de ponto (PyMuPDF tabelas — sem IA) ───────────────────────────
 
-def extrair_ponto(doc: fitz.Document) -> dict:
+def extrair_ponto(doc: fitz.Document, textos_paginas: list[str] | None = None) -> dict:
     """
     Extrai espelho de ponto usando detecção de tabelas do PyMuPDF.
     Sem IA — dados tabulares são determinísticos.
@@ -892,18 +1210,20 @@ def extrair_ponto(doc: fitz.Document) -> dict:
     registros = []
     DIAS = {"SEG","TER","QUA","QUI","SEX","SÁB","SAB","DOM"}
 
-    for pagina in doc:
-        texto_pag = pagina.get_text()
+    textos_paginas = textos_paginas or []
+    for idx, pagina in enumerate(doc):
+        texto_pag = textos_paginas[idx] if idx < len(textos_paginas) else pagina.get_text()
         if not re.search(
             r"CART[AÃ]O DE PONTO|ESPELHO DE PONTO|REGISTRO DE PONTO",
             texto_pag, re.IGNORECASE
         ):
             continue
 
+        registros_antes = len(registros)
         try:
             tabelas = pagina.find_tables()
         except Exception:
-            continue
+            tabelas = []
 
         for tabela in tabelas:
             try:
@@ -950,7 +1270,35 @@ def extrair_ponto(doc: fitz.Document) -> dict:
                     "observacao":       obs,
                 })
 
+        if len(registros) == registros_antes:
+            registros.extend(_extrair_ponto_texto_livre(texto_pag))
+
     if not registros:
         return {"erro": "Ponto não localizado ou sem tabelas detectáveis no PDF"}
 
     return {"registros": registros}
+
+
+def _extrair_ponto_texto_livre(texto: str) -> list[dict]:
+    """Fallback simples para OCR/texto corrido de espelho de ponto."""
+    registros = []
+    dias = r"SEG|TER|QUA|QUI|SEX|S[ÁA]B|SAB|DOM"
+    for linha in (texto or "").splitlines():
+        if not re.search(r"\d{2}/\d{2}/\d{4}", linha):
+            continue
+        horarios = re.findall(r"\b\d{1,2}:\d{2}(?::\d{2})?\b", linha)
+        if not horarios:
+            continue
+        data = re.search(r"\d{2}/\d{2}/\d{4}", linha).group(0)
+        dia_m = re.search(rf"\b({dias})\b", linha, re.IGNORECASE)
+        obs_m = re.search(r"\b(DSR|FALTA|FERIADO|FOLGA|AFASTAMENTO|F[ÉE]RIAS|ATESTADO)\b.*", linha, re.IGNORECASE)
+        registros.append({
+            "data": data,
+            "dia_semana": dia_m.group(1).upper().replace("Á", "A") if dia_m else "",
+            "entradas_saidas": horarios,
+            "horas_trabalhadas": "",
+            "horas_extras": "",
+            "observacao": obs_m.group(0).strip() if obs_m else "",
+            "fonte": "texto_ocr",
+        })
+    return registros
